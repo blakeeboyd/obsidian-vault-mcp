@@ -1,0 +1,21 @@
+{
+	"name": "obsidian-vault-mcp",
+	"version": "1.0.0",
+	"description": "Obsidian plugin exposing vault file operations over MCP",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"install-plugin": "node scripts/install.mjs",
+		"deploy": "npm run build && npm run install-plugin"
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"esbuild": "^0.24.0",
+		"obsidian": "latest",
+		"typescript": "^5.6.0"
+	},
+	"dependencies": {
+		"@huggingface/transformers": "^3.0.0"
+	}
+}

@@ -1,0 +1,9 @@
+{
+	"id": "obsidian-vault-mcp",
+	"name": "Vault MCP",
+	"version": "1.0.0",
+	"minAppVersion": "1.0.0",
+	"description": "Exposes vault file operations over MCP so Claude Code can rename, move, and manage files with automatic link updating.",
+	"author": "Blake Boyd",
+	"isDesktopOnly": true
+}
