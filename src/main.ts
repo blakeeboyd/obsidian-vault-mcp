@@ -18,6 +18,11 @@ import { SemanticIndex } from "./semantic";
 
 const AUTO_PORT_TRIES = 10;
 
+function formatProgress(label: string, done: number, total: number): string {
+	const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+	return `Vault MCP: ${label} ${done}/${total} (${pct}%)`;
+}
+
 class ExcludedFoldersModal extends Modal {
 	private plugin: VaultMcpPlugin;
 	private onClose_callback: () => void;
@@ -335,12 +340,50 @@ export default class VaultMcpPlugin extends Plugin {
 		const indexPath = normalizePath(`${dir}/embeddings.jsonl`);
 		const metaPath = normalizePath(`${dir}/embeddings-meta.json`);
 		this.semanticIndex = new SemanticIndex(this.app, indexPath, metaPath);
-		// Pre-load the stored index in the background. Model downloads lazily
-		// on first search or reindex.
-		this.semanticIndex.load().catch((err) =>
-			console.error("vault-mcp: failed to load semantic index:", err)
-		);
+		// Pre-load the stored index in the background, then reconcile against
+		// current vault state. Model downloads lazily — only triggered if the
+		// delta scan finds work to do.
+		this.semanticIndex
+			.load()
+			.then(() => this.runDeltaScan())
+			.catch((err) =>
+				console.error("vault-mcp: failed to load semantic index:", err)
+			);
 		return this.semanticIndex;
+	}
+
+	private async runDeltaScan(): Promise<void> {
+		if (!this.semanticIndex) return;
+		// Wait for the vault metadata cache so getMarkdownFiles() is populated.
+		await new Promise<void>((resolve) =>
+			this.app.workspace.onLayoutReady(() => resolve())
+		);
+		const notice = new Notice("Vault MCP: checking for changes…", 0);
+		try {
+			const result = await this.semanticIndex.deltaScan(
+				this.settings.excludedPaths,
+				(done, total) => {
+					this.semanticProgress = { done, total };
+					notice.setMessage(formatProgress("Delta scan", done, total));
+				}
+			);
+			const { added, updated, removed } = result;
+			if (added + updated + removed > 0) {
+				const summary = `Vault MCP: delta scan — ${added} added, ${updated} updated, ${removed} removed`;
+				console.log(summary);
+				notice.setMessage(summary);
+				setTimeout(() => notice.hide(), 4000);
+			} else {
+				notice.hide();
+			}
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.error("vault-mcp: delta scan failed:", err);
+			notice.setMessage(`Vault MCP: delta scan failed: ${msg}`);
+			setTimeout(() => notice.hide(), 6000);
+		} finally {
+			this.semanticProgress = null;
+		}
 	}
 
 	async reindexSemantic(): Promise<void> {
@@ -349,16 +392,19 @@ export default class VaultMcpPlugin extends Plugin {
 			return;
 		}
 		const index = this.initSemanticIndex();
-		new Notice("Vault MCP: starting semantic reindex…");
+		const notice = new Notice("Vault MCP: starting semantic reindex…", 0);
 		this.semanticProgress = { done: 0, total: 0 };
 		try {
 			await index.reindexAll(this.settings.excludedPaths, (done, total) => {
 				this.semanticProgress = { done, total };
+				notice.setMessage(formatProgress("Reindexing", done, total));
 			});
-			new Notice("Vault MCP: semantic index rebuilt.");
+			notice.setMessage("Vault MCP: semantic index rebuilt.");
+			setTimeout(() => notice.hide(), 4000);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			new Notice(`Vault MCP: reindex failed: ${msg}`);
+			notice.setMessage(`Vault MCP: reindex failed: ${msg}`);
+			setTimeout(() => notice.hide(), 6000);
 			console.error(err);
 		} finally {
 			this.semanticProgress = null;
@@ -435,10 +481,31 @@ export default class VaultMcpPlugin extends Plugin {
 
 class VaultMcpSettingTab extends PluginSettingTab {
 	plugin: VaultMcpPlugin;
+	private refreshTimer: number | null = null;
 
 	constructor(app: App, plugin: VaultMcpPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+	}
+
+	hide(): void {
+		if (this.refreshTimer !== null) {
+			window.clearTimeout(this.refreshTimer);
+			this.refreshTimer = null;
+		}
+	}
+
+	private scheduleRefreshIfIndexing(): void {
+		if (this.refreshTimer !== null) return;
+		const status = this.plugin.semanticIndex?.status(
+			this.plugin.settings.semantic.enabled
+		);
+		const indexing = status?.indexing || this.plugin.semanticProgress !== null;
+		if (!indexing) return;
+		this.refreshTimer = window.setTimeout(() => {
+			this.refreshTimer = null;
+			if (document.body.contains(this.containerEl)) this.display();
+		}, 1000);
 	}
 
 	display(): void {
@@ -554,6 +621,8 @@ class VaultMcpSettingTab extends PluginSettingTab {
 		codeEl2.createEl("code", {
 			text: `claude mcp add --transport http --scope project ${connectName} http://localhost:${this.plugin.settings.port}/mcp`,
 		});
+
+		this.scheduleRefreshIfIndexing();
 	}
 
 	private renderSemanticSection(containerEl: HTMLElement): void {
@@ -605,7 +674,10 @@ class VaultMcpSettingTab extends PluginSettingTab {
 				: { indexing: false, indexedFiles: 0, totalChunks: 0, lastIndexed: null };
 			if (this.plugin.semanticProgress) {
 				const { done, total } = this.plugin.semanticProgress;
-				statusEl.createEl("p", { text: `Indexing: ${done}/${total}` });
+				const pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+				statusEl.createEl("p", {
+					text: `Indexing: ${done}/${total} (${pct}%)`,
+				});
 			} else if (status.indexing) {
 				statusEl.createEl("p", { text: "Indexing…" });
 			} else if (status.indexedFiles > 0) {

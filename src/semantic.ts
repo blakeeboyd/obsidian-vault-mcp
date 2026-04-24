@@ -437,6 +437,69 @@ export class SemanticIndex {
 		if (this.indexLoaded) await this.persist();
 	}
 
+	// Reconcile stored index with current vault state without re-embedding
+	// unchanged files. Catches external edits (e.g. Synology sync) that bypass
+	// Obsidian's file events, which only fire while the app is running.
+	async deltaScan(
+		excludedPaths: string[],
+		onProgress?: (done: number, total: number) => void
+	): Promise<{ added: number; updated: number; removed: number }> {
+		await this.load();
+		if (this.indexing) return { added: 0, updated: 0, removed: 0 };
+
+		const files = this.app.vault
+			.getMarkdownFiles()
+			.filter((f) => !excludedPaths.some(
+				(ex) => f.path === ex || f.path.startsWith(ex + "/")
+			));
+		const currentPaths = new Set(files.map((f) => f.path));
+
+		const toRemove: string[] = [];
+		for (const path of this.byPath.keys()) {
+			if (!currentPaths.has(path)) toRemove.push(path);
+		}
+
+		const toEmbed: TFile[] = [];
+		let added = 0;
+		let updated = 0;
+		for (const file of files) {
+			const existing = this.byPath.get(file.path);
+			if (!existing) {
+				toEmbed.push(file);
+				added++;
+			} else if (existing[0]?.mtime !== file.stat.mtime) {
+				toEmbed.push(file);
+				updated++;
+			}
+		}
+
+		if (toRemove.length === 0 && toEmbed.length === 0) {
+			return { added: 0, updated: 0, removed: 0 };
+		}
+
+		this.indexing = true;
+		try {
+			for (const path of toRemove) this.removePath(path);
+
+			if (toEmbed.length > 0) {
+				await this.embedder.load();
+				const BATCH = 8;
+				let done = 0;
+				for (let i = 0; i < toEmbed.length; i += BATCH) {
+					const batch = toEmbed.slice(i, i + BATCH);
+					await Promise.all(batch.map((f) => this.reindexFile(f)));
+					done += batch.length;
+					onProgress?.(done, toEmbed.length);
+					await new Promise((r) => setTimeout(r, 0));
+				}
+			}
+			await this.persist();
+			return { added, updated, removed: toRemove.length };
+		} finally {
+			this.indexing = false;
+		}
+	}
+
 	// Rebuild index, optionally pruning entries for deleted files.
 	async reindexAll(
 		excludedPaths: string[],
