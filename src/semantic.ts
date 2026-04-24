@@ -1,10 +1,13 @@
 import { App, TFile, Notice, DataAdapter } from "obsidian";
+import { buildEmbedderIframeScript } from "./embedder-iframe";
 
-// Self-contained semantic search. Uses @huggingface/transformers to run
-// Xenova/all-MiniLM-L6-v2 (384-dim) locally inside the Obsidian renderer.
+// Self-contained semantic search. Transformers.js runs inside a hidden
+// iframe (loaded from a CDN via dynamic import), not in the main plugin
+// context — this sidesteps Electron's hybrid node+browser environment,
+// which otherwise makes transformers.js pick the node backend and fail.
 // Embeddings persist to <plugin-dir>/embeddings.jsonl, one chunk per line.
 
-const MODEL_ID = "Xenova/all-MiniLM-L6-v2";
+const MODEL_ID = "TaylorAI/bge-micro-v2";
 const EMBEDDING_DIM = 384;
 const INDEX_VERSION = 1;
 
@@ -130,57 +133,166 @@ function buildPreview(chunkText: string, maxLen = 180): string {
 	return flat.length > maxLen ? flat.slice(0, maxLen) + "…" : flat;
 }
 
-type EmbeddingPipeline = (
-	texts: string | string[],
-	opts?: { pooling?: "mean"; normalize?: boolean }
-) => Promise<{ data: Float32Array; dims: number[] }>;
+const IFRAME_ID = "vault-mcp-embedder-iframe";
+const LOAD_TIMEOUT_MS = 180_000; // model download + first compile can be slow
+const EMBED_TIMEOUT_MS = 120_000;
 
+interface PendingMessage {
+	resolve: (value: any) => void;
+	reject: (err: Error) => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+
+// Runs transformers.js inside a hidden iframe. The iframe dynamically
+// imports transformers.js as an ES module from jsDelivr, so nothing about
+// the library ends up in the main plugin bundle. Communication is
+// promise-correlated postMessage keyed on a per-instance message prefix.
 class Embedder {
-	private pipeline: EmbeddingPipeline | null = null;
+	private iframe: HTMLIFrameElement | null = null;
 	private loading: Promise<void> | null = null;
+	private loaded = false;
+	private pending: Map<string, PendingMessage> = new Map();
+	private messagePrefix = `vmcp_${Math.random().toString(36).slice(2, 10)}_`;
+	private nextMessageId = 0;
+	private listener: ((event: MessageEvent) => void) | null = null;
+	private readyPromise: Promise<void> | null = null;
+	private readyResolve: (() => void) | null = null;
 
 	isReady(): boolean {
-		return this.pipeline !== null;
+		return this.loaded;
 	}
 
 	async load(): Promise<void> {
-		if (this.pipeline) return;
+		if (this.loaded) return;
 		if (this.loading) return this.loading;
-		this.loading = (async () => {
-			// Dynamic import: keeps ~MB of transformers code out of the initial
-			// plugin load when semantic search is disabled.
-			const transformers: any = await import("@huggingface/transformers");
-			const env = transformers.env;
-			// Use HF Hub. Models cache in the Electron renderer's storage.
-			env.allowLocalModels = false;
-			env.useBrowserCache = true;
-			const pipe = await transformers.pipeline(
-				"feature-extraction",
-				MODEL_ID,
-				{ dtype: "q8" }
-			);
-			this.pipeline = pipe as EmbeddingPipeline;
-		})();
-		try {
-			await this.loading;
-		} finally {
+		this.loading = this.doLoad().finally(() => {
 			this.loading = null;
+		});
+		return this.loading;
+	}
+
+	private async doLoad(): Promise<void> {
+		// Drop any stale iframe from a previous plugin load in the same session.
+		const existing = document.getElementById(IFRAME_ID);
+		if (existing) existing.remove();
+
+		this.readyPromise = new Promise<void>((resolve) => {
+			this.readyResolve = resolve;
+		});
+
+		this.listener = (event: MessageEvent) => this.handleMessage(event);
+		window.addEventListener("message", this.listener);
+
+		const iframe = document.createElement("iframe");
+		iframe.id = IFRAME_ID;
+		iframe.style.display = "none";
+		// No sandbox attribute: Smart Connections' reference implementation
+		// runs unsandboxed so the iframe inherits the app:// origin and
+		// cross-origin ES-module imports from CDN work cleanly. A sandboxed
+		// iframe gets a null origin, which CSP-blocks dynamic import of the
+		// transformers.js module in some Electron builds.
+		const script = buildEmbedderIframeScript(IFRAME_ID);
+		iframe.srcdoc =
+			'<!doctype html><html><head><meta charset="utf-8"></head>' +
+			'<body><script type="module">' + script + '</script></body></html>';
+
+		document.body.appendChild(iframe);
+		this.iframe = iframe;
+
+		// Wait for the iframe module to signal readiness. onload fires when
+		// the document loads but can race the module's top-level evaluation;
+		// the iframe posts a __ready__ message once its listener is wired up.
+		await Promise.race([
+			this.readyPromise,
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("Embedder iframe never signalled ready")), 10_000)
+			),
+		]);
+
+		await this.sendMessage("load", { model_key: MODEL_ID }, LOAD_TIMEOUT_MS);
+		this.loaded = true;
+	}
+
+	private handleMessage(event: MessageEvent): void {
+		const data = event.data;
+		if (!data || typeof data !== "object") return;
+		if (data.iframe_id !== IFRAME_ID) return;
+
+		// Boot handshake: iframe announces its listener is live.
+		if (data.id === "__ready__") {
+			this.readyResolve?.();
+			return;
 		}
+
+		const id = data.id;
+		if (typeof id !== "string") return;
+		const entry = this.pending.get(id);
+		if (!entry) return;
+		this.pending.delete(id);
+		clearTimeout(entry.timer);
+		if (data.error) entry.reject(new Error(data.error));
+		else entry.resolve(data.result);
+	}
+
+	private sendMessage<T = any>(
+		method: string,
+		params: any,
+		timeoutMs: number
+	): Promise<T> {
+		const iframeWindow = this.iframe?.contentWindow;
+		if (!iframeWindow) return Promise.reject(new Error("Embedder iframe not available"));
+		const id = this.messagePrefix + this.nextMessageId++;
+		return new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				if (this.pending.has(id)) {
+					this.pending.delete(id);
+					reject(new Error(`Embedder ${method} timed out after ${timeoutMs}ms`));
+				}
+			}, timeoutMs);
+			this.pending.set(id, { resolve, reject, timer });
+			iframeWindow.postMessage({ id, method, params, iframe_id: IFRAME_ID }, "*");
+		});
 	}
 
 	async embed(texts: string[]): Promise<Float32Array[]> {
-		if (!this.pipeline) throw new Error("Embedder not loaded");
+		if (!this.loaded) throw new Error("Embedder not loaded");
 		if (texts.length === 0) return [];
-		const output = await this.pipeline(texts, {
-			pooling: "mean",
-			normalize: true,
-		});
-		const result: Float32Array[] = [];
-		for (let i = 0; i < texts.length; i++) {
-			const start = i * EMBEDDING_DIM;
-			result.push(output.data.slice(start, start + EMBEDDING_DIM));
+		const { vectors, dim } = await this.sendMessage<{
+			vectors: number[][];
+			dim: number;
+		}>("embed_batch", { texts }, EMBED_TIMEOUT_MS);
+		if (dim !== EMBEDDING_DIM) {
+			throw new Error(
+				`Embedder returned dim ${dim}, expected ${EMBEDDING_DIM} for ${MODEL_ID}`
+			);
 		}
-		return result;
+		return vectors.map((v) => Float32Array.from(v));
+	}
+
+	async unload(): Promise<void> {
+		if (this.loaded) {
+			try {
+				await this.sendMessage("unload", {}, 5000);
+			} catch {
+				// best effort
+			}
+		}
+		if (this.listener) {
+			window.removeEventListener("message", this.listener);
+			this.listener = null;
+		}
+		for (const entry of this.pending.values()) {
+			clearTimeout(entry.timer);
+			entry.reject(new Error("Embedder unloaded"));
+		}
+		this.pending.clear();
+		if (this.iframe) {
+			this.iframe.remove();
+			this.iframe = null;
+		}
+		this.loaded = false;
+		this.readyPromise = null;
+		this.readyResolve = null;
 	}
 }
 
