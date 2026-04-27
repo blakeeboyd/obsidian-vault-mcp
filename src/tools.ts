@@ -628,7 +628,9 @@ async function handleWriteFile(
 
 	const existing = app.vault.getAbstractFileByPath(path);
 	if (existing && existing instanceof TFile) {
-		await app.vault.adapter.write(path, content);
+		// vault.modify (vs adapter.write) fires the "modify" vault event that
+		// other plugins subscribe to, including this plugin's auto-reindex.
+		await app.vault.modify(existing, content);
 		return textResult(`Updated file: ${path}`);
 	} else if (existing) {
 		return errorResult(`A folder exists at: ${path}`);

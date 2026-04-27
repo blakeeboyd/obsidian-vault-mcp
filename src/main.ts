@@ -423,18 +423,21 @@ export default class VaultMcpPlugin extends Plugin {
 	}
 
 	private registerFileEvents(): void {
-		this.registerEvent(
-			this.app.vault.on("modify", (file) => {
-				if (!(file instanceof TFile)) return;
-				if (file.extension !== "md") return;
-				if (!this.settings.semantic.enabled) return;
-				if (!this.settings.semantic.autoReindex) return;
-				if (!this.semanticIndex) return;
-				this.semanticIndex
-					.reindexFile(file)
-					.catch((err) => console.error("vault-mcp: auto-reindex failed:", err));
-			})
-		);
+		const reindexOnEvent = (file: TAbstractFile) => {
+			if (!(file instanceof TFile)) return;
+			if (file.extension !== "md") return;
+			if (!this.settings.semantic.enabled) return;
+			if (!this.settings.semantic.autoReindex) return;
+			if (!this.semanticIndex) return;
+			this.semanticIndex
+				.reindexFile(file)
+				.catch((err) => console.error("vault-mcp: auto-reindex failed:", err));
+		};
+		this.registerEvent(this.app.vault.on("modify", reindexOnEvent));
+		// "create" covers new files written via the MCP write_file tool, which
+		// goes through vault.create. Without this subscription, new files are
+		// not embedded until the next manual reindex or delta scan.
+		this.registerEvent(this.app.vault.on("create", reindexOnEvent));
 		this.registerEvent(
 			this.app.vault.on("delete", (file: TAbstractFile) => {
 				if (!this.semanticIndex) return;
