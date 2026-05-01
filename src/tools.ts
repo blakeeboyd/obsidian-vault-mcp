@@ -434,10 +434,8 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
 				name: "Query by Tag",
 				desc: "Find files with a specific tag",
 			},
-			semantic_search: {
-				name: "Semantic Search",
-				desc: "Find related notes by meaning (configure below)",
-			},
+			// semantic_search is gated by the Semantic Search section's
+			// "Enable semantic search" toggle, not a separate per-tool toggle.
 		},
 	},
 	{

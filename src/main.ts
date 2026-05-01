@@ -244,12 +244,19 @@ class ExcludedFoldersModal extends Modal {
 	}
 }
 
+// Auto-reindex debounce. modify/create events fire on every Obsidian autosave
+// (~2s after typing stops). Re-embedding on every save chews main-thread time
+// for no perceptible search-quality gain, so coalesce per file: a quiet
+// window of this length must pass before re-embedding.
+const AUTO_REINDEX_DEBOUNCE_MS = 15_000;
+
 export default class VaultMcpPlugin extends Plugin {
 	settings: VaultMcpSettings = DEFAULT_SETTINGS;
 	server: McpHttpServer | null = null;
 	semanticIndex: SemanticIndex | null = null;
 	// Updated by reindex runs; reflected in the settings tab.
 	semanticProgress: { done: number; total: number } | null = null;
+	private reindexTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -272,9 +279,40 @@ export default class VaultMcpPlugin extends Plugin {
 			name: "Semantic search: clear index",
 			callback: () => this.clearSemanticIndex(),
 		});
+		this.addCommand({
+			id: "compact-semantic-index",
+			name: "Semantic search: compact index (dedupe and rewrite)",
+			callback: () => this.compactSemanticIndex(),
+		});
+	}
+
+	async compactSemanticIndex(): Promise<void> {
+		if (!this.settings.semantic.enabled) {
+			new Notice("Vault MCP: enable semantic search in settings first.");
+			return;
+		}
+		const index = this.initSemanticIndex();
+		const notice = new Notice("Vault MCP: compacting semantic index…", 0);
+		try {
+			const result = await index.compactAndPersist();
+			const dropped = result.chunksBefore - result.chunksAfter;
+			const summary =
+				dropped > 0
+					? `Vault MCP: compacted — dropped ${dropped} duplicate chunks (${result.chunksBefore} → ${result.chunksAfter}, ${result.filesIndexed} files)`
+					: `Vault MCP: index already clean — ${result.chunksAfter} chunks across ${result.filesIndexed} files`;
+			console.log(summary);
+			notice.setMessage(summary);
+			setTimeout(() => notice.hide(), 6000);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			notice.setMessage(`Vault MCP: compact failed: ${msg}`);
+			setTimeout(() => notice.hide(), 6000);
+			console.error(err);
+		}
 	}
 
 	async onunload(): Promise<void> {
+		this.clearAllReindexTimers();
 		await this.stopServer();
 	}
 
@@ -340,15 +378,20 @@ export default class VaultMcpPlugin extends Plugin {
 		const indexPath = normalizePath(`${dir}/embeddings.jsonl`);
 		const metaPath = normalizePath(`${dir}/embeddings-meta.json`);
 		this.semanticIndex = new SemanticIndex(this.app, indexPath, metaPath);
-		// Pre-load the stored index in the background, then reconcile against
-		// current vault state. Model downloads lazily — only triggered if the
-		// delta scan finds work to do.
-		this.semanticIndex
-			.load()
-			.then(() => this.runDeltaScan())
-			.catch((err) =>
-				console.error("vault-mcp: failed to load semantic index:", err)
-			);
+		// Defer the load until Obsidian's layout is ready. Parsing a 100MB+
+		// embeddings.jsonl involves tens of thousands of JSON.parse +
+		// base64-decode calls, and running those during plugin onload competes
+		// with Obsidian's own startup work. Once layout is ready, kick off the
+		// load and reconcile against current vault state. Model downloads
+		// lazily — only triggered if the delta scan finds work to do.
+		this.app.workspace.onLayoutReady(() => {
+			this.semanticIndex
+				?.load()
+				.then(() => this.runDeltaScan())
+				.catch((err) =>
+					console.error("vault-mcp: failed to load semantic index:", err)
+				);
+		});
 		return this.semanticIndex;
 	}
 
@@ -422,30 +465,62 @@ export default class VaultMcpPlugin extends Plugin {
 		new Notice("Vault MCP: semantic index cleared.");
 	}
 
+	private scheduleReindex(file: TFile): void {
+		const existing = this.reindexTimers.get(file.path);
+		if (existing) clearTimeout(existing);
+		const path = file.path;
+		const timer = setTimeout(() => {
+			this.reindexTimers.delete(path);
+			if (!this.settings.semantic.enabled) return;
+			if (!this.settings.semantic.autoReindex) return;
+			if (!this.semanticIndex) return;
+			// Re-resolve in case the file was renamed or deleted while pending.
+			const current = this.app.vault.getAbstractFileByPath(path);
+			if (!(current instanceof TFile)) return;
+			this.semanticIndex
+				.reindexFile(current)
+				.catch((err) => console.error("vault-mcp: auto-reindex failed:", err));
+		}, AUTO_REINDEX_DEBOUNCE_MS);
+		this.reindexTimers.set(path, timer);
+	}
+
+	private clearReindexTimer(path: string): void {
+		const timer = this.reindexTimers.get(path);
+		if (timer) {
+			clearTimeout(timer);
+			this.reindexTimers.delete(path);
+		}
+	}
+
+	private clearAllReindexTimers(): void {
+		for (const timer of this.reindexTimers.values()) clearTimeout(timer);
+		this.reindexTimers.clear();
+	}
+
 	private registerFileEvents(): void {
-		const reindexOnEvent = (file: TAbstractFile) => {
+		const scheduleOnEvent = (file: TAbstractFile) => {
 			if (!(file instanceof TFile)) return;
 			if (file.extension !== "md") return;
 			if (!this.settings.semantic.enabled) return;
 			if (!this.settings.semantic.autoReindex) return;
 			if (!this.semanticIndex) return;
-			this.semanticIndex
-				.reindexFile(file)
-				.catch((err) => console.error("vault-mcp: auto-reindex failed:", err));
+			this.scheduleReindex(file);
 		};
-		this.registerEvent(this.app.vault.on("modify", reindexOnEvent));
+		this.registerEvent(this.app.vault.on("modify", scheduleOnEvent));
 		// "create" covers new files written via the MCP write_file tool, which
 		// goes through vault.create. Without this subscription, new files are
 		// not embedded until the next manual reindex or delta scan.
-		this.registerEvent(this.app.vault.on("create", reindexOnEvent));
+		this.registerEvent(this.app.vault.on("create", scheduleOnEvent));
 		this.registerEvent(
 			this.app.vault.on("delete", (file: TAbstractFile) => {
+				this.clearReindexTimer(file.path);
 				if (!this.semanticIndex) return;
 				this.semanticIndex.removeFile(file.path).catch(() => {});
 			})
 		);
 		this.registerEvent(
 			this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+				this.clearReindexTimer(oldPath);
 				if (!this.semanticIndex) return;
 				this.semanticIndex.renameFile(oldPath, file.path).catch(() => {});
 			})
@@ -632,8 +707,8 @@ class VaultMcpSettingTab extends PluginSettingTab {
 		containerEl.createEl("h3", { text: "Semantic Search" });
 		containerEl.createEl("p", {
 			text:
-				"Runs locally via all-MiniLM-L6-v2 (384-dim). First use downloads " +
-				"the model (~25 MB) from Hugging Face. The index lives inside the plugin folder.",
+				"Runs locally via TaylorAI/bge-micro-v2 (384-dim). First use downloads " +
+				"the model (~22 MB) from Hugging Face. The index lives inside the plugin folder.",
 			cls: "setting-item-description",
 		});
 

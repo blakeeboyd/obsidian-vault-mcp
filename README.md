@@ -50,16 +50,16 @@ Two things this plugin gets right that shell-level tools don't:
 
 ## Semantic search
 
-The `semantic_search` tool finds notes by meaning rather than keyword match. It runs locally — embeddings are computed in the plugin's own process and stored inside the plugin folder.
+The `semantic_search` tool finds notes by meaning rather than keyword match. It runs locally. Embeddings are computed in a hidden iframe inside Obsidian and stored in the plugin folder.
 
 ### How it works
 
-- **Model:** `Xenova/all-MiniLM-L6-v2`, a 384-dimensional English-primarily sentence encoder. Quantized ONNX (~25 MB). Loaded through [`@huggingface/transformers`](https://github.com/huggingface/transformers.js), which runs ONNX Runtime Web under the hood.
-- **First use:** the model is downloaded from the Hugging Face CDN and cached by Obsidian's renderer. Subsequent sessions load from cache with no network needed.
+- **Model:** `TaylorAI/bge-micro-v2`, a 384-dimensional sentence encoder. Quantized ONNX (~22 MB). Loaded via [`@huggingface/transformers`](https://github.com/huggingface/transformers.js) running ONNX Runtime Web on WASM.
+- **First use:** transformers.js and the model are pulled from the jsDelivr and Hugging Face CDNs respectively, then cached by Obsidian's renderer. Subsequent sessions load from cache with no network needed.
 - **Chunking:** each markdown file is stripped of frontmatter and HTML comments, then split on blank lines into chunks of up to ~1,500 characters (with ~200-character overlap). Very short notes are kept as a single chunk. Every chunk is prefixed with the file path so the embedding has weak title context when the chunk alone is ambiguous.
-- **Embedding:** chunks are embedded in batches of 8, with mean pooling and L2 normalization. Because vectors are normalized, cosine similarity reduces to a dot product at query time.
+- **Embedding:** files are processed 8 at a time in parallel. Each chunk is tokenized, truncated to 510 BPE tokens if needed, embedded one at a time inside the iframe, mean-pooled, and L2-normalized. Because vectors are normalized, cosine similarity reduces to a dot product at query time.
 - **Storage:** vectors live in `.obsidian/plugins/obsidian-vault-mcp/embeddings.jsonl`, one JSON Lines entry per chunk. Vectors are base64-encoded `Float32Array` bytes for compactness (~2 KB per chunk). A companion `embeddings-meta.json` records model, dimension, and last-updated timestamp.
-- **Incremental:** `reindexAll` checks each file's mtime against the stored entry and only re-embeds changed files. Deleted files are pruned. Renames are handled by the file-event listener.
+- **Incremental:** on plugin load, a delta scan reconciles the stored index against the current vault: new and modified files are embedded, dropped files are removed. A full `reindexAll` checks mtimes the same way and only re-embeds what has changed.
 - **Query:** the query string is embedded, scored against every stored chunk, sorted, then deduplicated by path so each file appears at most once with its best-scoring chunk.
 
 ### Enabling it
@@ -69,9 +69,17 @@ Semantic search is **off by default** so users who never touch it don't pay the 
 1. Open Obsidian Settings → Vault MCP.
 2. Under **Semantic Search**, toggle **Enable semantic search** on.
 3. Click **Reindex**. First run downloads the model, then embeds every markdown file in the vault. Progress is shown in the settings panel and as notices.
-4. Subsequent runs are incremental — only changed files are re-embedded.
+4. Subsequent runs are incremental. Only changed files are re-embedded.
 
-Auto-reindex on modify is a separate toggle, off by default. Leave it off if you edit many files at once; use the Reindex button when you want a fresh index. Turn it on if you want always-current results and don't mind a small delay on save.
+**Auto-reindex on modify** is a separate toggle, off by default. When on, modify and create events schedule a per-file re-embed with a 15-second trailing debounce so editing bursts don't trigger an embed on every save. Renames and deletes cancel any pending timer. Turn it off if you prefer to control reindex timing yourself with the Reindex button.
+
+### Commands
+
+Three commands are available in the Obsidian command palette:
+
+- **Semantic search: reindex vault.** Full incremental rebuild.
+- **Semantic search: clear index.** Delete `embeddings.jsonl` and the meta file.
+- **Semantic search: compact index (dedupe and rewrite).** Reload from disk (which deduplicates by `(path, chunk)` tuple) and persist back. Useful as a recovery hatch if a buggy session ever leaves duplicates in the index file.
 
 ### Why not Smart Connections?
 
@@ -79,7 +87,7 @@ The old version of this plugin called into the Smart Connections plugin to answe
 
 ## Multi-vault use
 
-The plugin now supports running in several vaults at the same time.
+The plugin supports running in several vaults at the same time.
 
 - **Port auto-increment** is on by default. If the configured port (27182) is in use, the plugin tries the next few ports and saves whichever one it binds. The settings panel shows the active port.
 - **Per-vault server name.** The MCP `initialize` response advertises the server as `obsidian-vault-mcp (<vault name>)` so MCP clients can tell instances apart in logs.
@@ -170,7 +178,7 @@ claude mcp add --transport http --scope project obsidian-vault http://localhost:
 
 ### Server
 
-A plain Node `http` server on `127.0.0.1`. Accepts `POST /mcp` with a JSON-RPC 2.0 body. Supports `initialize`, `tools/list`, `tools/call`, and `ping`. CORS is open (`*`) because the client is always local — network egress is blocked by binding to loopback.
+A plain Node `http` server on `127.0.0.1`. Accepts `POST /mcp` with a JSON-RPC 2.0 body. Supports `initialize`, `tools/list`, `tools/call`, and `ping`. CORS is open (`*`) because the client is always local. Network egress is blocked by binding to loopback.
 
 ### Tool dispatch
 
@@ -178,7 +186,13 @@ A plain Node `http` server on `127.0.0.1`. Accepts `POST /mcp` with a JSON-RPC 2
 
 ### Semantic index lifecycle
 
-- Lazy-initialized on plugin load if `settings.semantic.enabled` is true.
-- Model and stored index both load on first call that needs them.
-- File events (`modify`, `delete`, `rename`) update the in-memory index. Modify events only re-embed if `autoReindex` is on.
-- Persist happens at the end of a full reindex and after delete/rename events. Individual `modify` events keep edits in memory until the next full reindex for speed.
+- Lazy-initialized on plugin load if `settings.semantic.enabled` is true. The first parse is gated behind `workspace.onLayoutReady` so it doesn't compete with Obsidian's startup.
+- The stored index loads through a cached promise so concurrent callers (initial load, delta scan, ensureReady from auto-reindex) share one parse pass. Without this guard, racing loads would each push a fresh copy of every entry into memory.
+- Parse yields to the event loop every 500 lines so large indexes don't block the renderer.
+- After parse, entries are deduped by `(path, chunk)` tuple as a backstop against any pre-existing bloat on disk.
+- File events: `modify` and `create` schedule a per-file debounced reindex; `delete` cancels any pending timer and removes the file's chunks; `rename` cancels the old-path timer and updates the in-memory paths.
+- Persist runs at the end of a full reindex, after a delta scan that did work, and inside delete or rename events. Debounced auto-reindexes update memory without writing to disk. The next full reindex or the **Compact index** command persists them.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -37,12 +37,16 @@ export async function handleMcpRequest(
 				},
 			};
 
-		case "tools/list":
+		case "tools/list": {
+			const tools = getEnabledTools(settings.enabledTools).filter(
+				(t) => t.name !== "semantic_search" || settings.semantic.enabled
+			);
 			return {
 				jsonrpc: "2.0",
 				id: request.id,
-				result: { tools: getEnabledTools(settings.enabledTools) },
+				result: { tools },
 			};
+		}
 
 		case "tools/call": {
 			const params = request.params || {};

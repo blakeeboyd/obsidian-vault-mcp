@@ -302,6 +302,7 @@ export class SemanticIndex {
 	private embedder = new Embedder();
 	private indexing = false;
 	private indexLoaded = false;
+	private loadingPromise: Promise<void> | null = null;
 	private lastIndexedAt: number | null = null;
 
 	constructor(
@@ -328,6 +329,19 @@ export class SemanticIndex {
 
 	async load(): Promise<void> {
 		if (this.indexLoaded) return;
+		// Cache the in-flight promise so concurrent callers (initSemanticIndex,
+		// ensureReady from reindexFile, deltaScan, modify-event reindexes)
+		// share one parse pass. Without this guard, racing loads each ran the
+		// full parse loop and pushed duplicate copies of every entry into
+		// `this.entries`, leaving byPath correct but entries Nx bloated.
+		if (this.loadingPromise) return this.loadingPromise;
+		this.loadingPromise = this.doLoad().finally(() => {
+			this.loadingPromise = null;
+		});
+		return this.loadingPromise;
+	}
+
+	private async doLoad(): Promise<void> {
 		const adapter = this.adapter();
 		if (!(await adapter.exists(this.indexPath))) {
 			this.indexLoaded = true;
@@ -335,24 +349,67 @@ export class SemanticIndex {
 		}
 		try {
 			const raw = await adapter.read(this.indexPath);
-			for (const line of raw.split("\n")) {
+			const lines = raw.split("\n");
+			const YIELD_EVERY = 500;
+			let skipped = 0;
+			for (let i = 0; i < lines.length; i++) {
+				const line = lines[i];
 				if (!line.trim()) continue;
-				const obj = JSON.parse(line) as StoredEntry;
-				const entry: IndexEntry = {
-					path: obj.p,
-					chunk: obj.c,
-					mtime: obj.m,
-					vector: float32FromBase64(obj.v),
-					preview: obj.s || "",
-				};
+				let entry: IndexEntry;
+				try {
+					const obj = JSON.parse(line) as StoredEntry;
+					entry = {
+						path: obj.p,
+						chunk: obj.c,
+						mtime: obj.m,
+						vector: float32FromBase64(obj.v),
+						preview: obj.s || "",
+					};
+				} catch {
+					// Skip a single corrupt line rather than dumping the whole
+					// index. Corruption can come from a partial write during a
+					// crash or a stray newline in a preview field. Affected
+					// files will show up as missing in the next delta scan and
+					// get re-embedded.
+					skipped++;
+					continue;
+				}
 				this.entries.push(entry);
 				const list = this.byPath.get(entry.path) || [];
 				list.push(entry);
 				this.byPath.set(entry.path, list);
+				// Yield to the event loop periodically. Large indexes (100k+
+				// chunks) otherwise block the renderer for many seconds while
+				// JSON.parse + base64 decode run synchronously.
+				if (i > 0 && i % YIELD_EVERY === 0) {
+					await new Promise((r) => setTimeout(r, 0));
+				}
+			}
+			if (skipped > 0) {
+				console.warn(
+					`vault-mcp: skipped ${skipped} corrupt line(s) while loading semantic index`
+				);
 			}
 			if (await adapter.exists(this.metaPath)) {
 				const meta: IndexMeta = JSON.parse(await adapter.read(this.metaPath));
 				this.lastIndexedAt = meta.updated || null;
+			}
+			// Dedupe by (path, chunk) tuple. If the on-disk index was written
+			// by a buggy session (e.g. before the load-race fix), the same
+			// chunk can appear N times. Collapse to the first occurrence per
+			// (path, chunk) and rebuild entries from byPath as the source of
+			// truth.
+			this.entries = [];
+			for (const [path, list] of this.byPath.entries()) {
+				const seen = new Set<number>();
+				const unique: IndexEntry[] = [];
+				for (const e of list) {
+					if (seen.has(e.chunk)) continue;
+					seen.add(e.chunk);
+					unique.push(e);
+				}
+				this.byPath.set(path, unique);
+				this.entries.push(...unique);
 			}
 			this.indexLoaded = true;
 		} catch (err) {
@@ -362,6 +419,31 @@ export class SemanticIndex {
 			this.byPath.clear();
 			this.indexLoaded = true;
 		}
+	}
+
+	// Recovery hatch: load (which dedupes), then persist the deduped state
+	// back to disk. Safe to run anytime. Returns counts so the caller can
+	// report how much bloat was dropped.
+	async compactAndPersist(): Promise<{
+		filesIndexed: number;
+		chunksBefore: number;
+		chunksAfter: number;
+	}> {
+		const adapter = this.adapter();
+		let chunksBefore = 0;
+		if (await adapter.exists(this.indexPath)) {
+			const raw = await adapter.read(this.indexPath);
+			for (const line of raw.split("\n")) {
+				if (line.trim()) chunksBefore++;
+			}
+		}
+		await this.load();
+		await this.persist();
+		return {
+			filesIndexed: this.byPath.size,
+			chunksBefore,
+			chunksAfter: this.entries.length,
+		};
 	}
 
 	private async persist(): Promise<void> {
