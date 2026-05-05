@@ -24,6 +24,16 @@ export interface SemanticSearchResult {
 	snippet: string;
 }
 
+export interface RelatedNote {
+	path: string;
+	score: number;
+	snippet: string;
+	sourceChunkIndex?: number;
+	sourceChunkText?: string;
+	candidateChunkIndex?: number;
+	candidateChunkText?: string;
+}
+
 export interface SemanticStatus {
 	enabled: boolean;
 	modelLoaded: boolean;
@@ -304,6 +314,9 @@ export class SemanticIndex {
 	private indexLoaded = false;
 	private loadingPromise: Promise<void> | null = null;
 	private lastIndexedAt: number | null = null;
+	// Mean-pooled, L2-renormalized note vectors for find_related_notes.
+	// Computed lazily and busted whenever the underlying chunks change.
+	private noteVectorCache: Map<string, Float32Array> = new Map();
 
 	constructor(
 		private app: App,
@@ -473,6 +486,34 @@ export class SemanticIndex {
 		if (!this.byPath.has(path)) return;
 		this.entries = this.entries.filter((e) => e.path !== path);
 		this.byPath.delete(path);
+		this.noteVectorCache.delete(path);
+	}
+
+	private noteMeanVector(path: string): Float32Array | null {
+		const cached = this.noteVectorCache.get(path);
+		if (cached) return cached;
+		const entries = this.byPath.get(path);
+		if (!entries || entries.length === 0) return null;
+
+		const dim = EMBEDDING_DIM;
+		const sum = new Float32Array(dim);
+		for (const entry of entries) {
+			for (let i = 0; i < dim; i++) sum[i] += entry.vector[i];
+		}
+
+		// Re-normalize. Chunk vectors are L2-normalized at embed time, but
+		// the average of unit vectors is not itself a unit vector, so cosine
+		// would be wrong without this step.
+		let norm = 0;
+		for (let i = 0; i < dim; i++) norm += sum[i] * sum[i];
+		norm = Math.sqrt(norm);
+		if (norm === 0) return null;
+
+		const mean = new Float32Array(dim);
+		for (let i = 0; i < dim; i++) mean[i] = sum[i] / norm;
+
+		this.noteVectorCache.set(path, mean);
+		return mean;
 	}
 
 	async ensureReady(): Promise<void> {
@@ -503,6 +544,7 @@ export class SemanticIndex {
 		}));
 		this.entries.push(...entries);
 		this.byPath.set(file.path, entries);
+		this.noteVectorCache.delete(file.path);
 	}
 
 	async removeFile(path: string): Promise<void> {
@@ -516,6 +558,10 @@ export class SemanticIndex {
 		for (const e of entries) e.path = newPath;
 		this.byPath.delete(oldPath);
 		this.byPath.set(newPath, entries);
+		// Move the cached vector if it exists. Same vector content, new key.
+		const cached = this.noteVectorCache.get(oldPath);
+		this.noteVectorCache.delete(oldPath);
+		if (cached) this.noteVectorCache.set(newPath, cached);
 		if (this.indexLoaded) await this.persist();
 	}
 
@@ -616,6 +662,97 @@ export class SemanticIndex {
 		} finally {
 			this.indexing = false;
 		}
+	}
+
+	// Note-driven discovery: given a note's path, return other notes ranked
+	// by mean-pooled cosine similarity. Mean pool implicitly favors atomic
+	// notes; multi-topic notes will give muddier results.
+	async findRelatedNotes(
+		sourcePath: string,
+		opts: {
+			limit: number;
+			filter?: string;
+			excludePrefix?: string[];
+			excludedPaths: string[];
+			includeEvidence?: boolean;
+		}
+	): Promise<RelatedNote[]> {
+		await this.load();
+		if (this.entries.length === 0) return [];
+
+		const sourceVec = this.noteMeanVector(sourcePath);
+		if (!sourceVec) {
+			throw new Error(
+				`No embeddings found for ${sourcePath}. The file may not be indexed yet — try a reindex.`
+			);
+		}
+
+		const candidates: { path: string; score: number; vec: Float32Array }[] = [];
+		for (const path of this.byPath.keys()) {
+			if (path === sourcePath) continue;
+			if (opts.filter && !path.startsWith(opts.filter)) continue;
+			if (opts.excludePrefix?.some((ex) => path.startsWith(ex))) continue;
+			if (
+				opts.excludedPaths.some(
+					(ex) => path === ex || path.startsWith(ex + "/")
+				)
+			) {
+				continue;
+			}
+			const vec = this.noteMeanVector(path);
+			if (!vec) continue;
+			candidates.push({ path, score: cosineSimilarity(sourceVec, vec), vec });
+		}
+
+		candidates.sort((a, b) => b.score - a.score);
+		const top = candidates.slice(0, opts.limit);
+
+		const sourceEntries = this.byPath.get(sourcePath) || [];
+
+		return top.map((c) => {
+			const candEntries = this.byPath.get(c.path) || [];
+
+			// Best candidate chunk wrt source vector — drives the snippet.
+			let bestCandIdx = candEntries[0]?.chunk ?? 0;
+			let bestCandScore = -Infinity;
+			let bestCandPreview = candEntries[0]?.preview ?? "";
+			for (const e of candEntries) {
+				const s = cosineSimilarity(e.vector, sourceVec);
+				if (s > bestCandScore) {
+					bestCandScore = s;
+					bestCandIdx = e.chunk;
+					bestCandPreview = e.preview;
+				}
+			}
+
+			const result: RelatedNote = {
+				path: c.path,
+				score: c.score,
+				snippet: bestCandPreview,
+			};
+
+			if (opts.includeEvidence) {
+				// Best source chunk wrt candidate vector — the other half of
+				// the chunk-pair "why this connects" view.
+				let bestSrcIdx = sourceEntries[0]?.chunk ?? 0;
+				let bestSrcScore = -Infinity;
+				let bestSrcPreview = sourceEntries[0]?.preview ?? "";
+				for (const e of sourceEntries) {
+					const s = cosineSimilarity(e.vector, c.vec);
+					if (s > bestSrcScore) {
+						bestSrcScore = s;
+						bestSrcIdx = e.chunk;
+						bestSrcPreview = e.preview;
+					}
+				}
+				result.sourceChunkIndex = bestSrcIdx;
+				result.sourceChunkText = bestSrcPreview;
+				result.candidateChunkIndex = bestCandIdx;
+				result.candidateChunkText = bestCandPreview;
+			}
+
+			return result;
+		});
 	}
 
 	async search(

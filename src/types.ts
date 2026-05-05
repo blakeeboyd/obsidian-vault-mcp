@@ -44,6 +44,7 @@ export interface ToolToggles {
 	patch_content: boolean;
 	open_file: boolean;
 	semantic_search: boolean;
+	find_related_notes: boolean;
 	list_templates: boolean;
 	create_from_template: boolean;
 	get_vault_info: boolean;
@@ -88,6 +89,7 @@ export const DEFAULT_SETTINGS: VaultMcpSettings = {
 		patch_content: true,
 		open_file: true,
 		semantic_search: true,
+		find_related_notes: true,
 		list_templates: true,
 		create_from_template: true,
 		get_vault_info: true,

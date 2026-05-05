@@ -14,7 +14,7 @@ import { VaultMcpSettings, DEFAULT_SETTINGS, ToolToggles } from "./types";
 import { McpHttpServer } from "./server";
 import { handleMcpRequest } from "./handlers";
 import { TOOL_CATEGORIES } from "./tools";
-import { SemanticIndex } from "./semantic";
+import { SemanticIndex, RelatedNote } from "./semantic";
 
 const AUTO_PORT_TRIES = 10;
 
@@ -244,6 +244,176 @@ class ExcludedFoldersModal extends Modal {
 	}
 }
 
+class RelatedNotesModal extends Modal {
+	private plugin: VaultMcpPlugin;
+	private sourceFile: TFile;
+
+	constructor(app: App, plugin: VaultMcpPlugin, sourceFile: TFile) {
+		super(app);
+		this.plugin = plugin;
+		this.sourceFile = sourceFile;
+	}
+
+	onOpen(): void {
+		this.modalEl.addClass("vault-mcp-related-modal");
+		this.injectStyles();
+		this.renderLoading();
+		this.runSearch().catch((err) => {
+			const msg = err instanceof Error ? err.message : String(err);
+			this.renderError(msg);
+		});
+	}
+
+	private injectStyles(): void {
+		const id = "vault-mcp-related-styles";
+		if (document.getElementById(id)) return;
+		const style = document.createElement("style");
+		style.id = id;
+		style.textContent = `
+			.vault-mcp-related-modal .related-row {
+				padding: 8px 12px;
+				cursor: pointer;
+				border-radius: 4px;
+				margin-bottom: 4px;
+				border: 1px solid transparent;
+			}
+			.vault-mcp-related-modal .related-row:hover {
+				background: var(--background-modifier-hover);
+				border-color: var(--background-modifier-border);
+			}
+			.vault-mcp-related-modal .related-path {
+				font-weight: 500;
+			}
+			.vault-mcp-related-modal .related-score {
+				color: var(--text-muted);
+				font-size: var(--font-smallest);
+				margin-left: 8px;
+			}
+			.vault-mcp-related-modal .related-snippet {
+				color: var(--text-muted);
+				font-size: var(--font-ui-small);
+				margin-top: 4px;
+			}
+			.vault-mcp-related-modal .related-actions {
+				margin-top: 6px;
+				display: flex;
+				gap: 6px;
+			}
+			.vault-mcp-related-modal .related-actions button {
+				font-size: var(--font-smallest);
+				padding: 2px 8px;
+			}
+		`;
+		document.head.appendChild(style);
+	}
+
+	private renderLoading(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h3", { text: `Related to: ${this.sourceFile.basename}` });
+		contentEl.createEl("p", {
+			text: "Searching…",
+			cls: "setting-item-description",
+		});
+	}
+
+	private renderError(msg: string): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h3", { text: `Related to: ${this.sourceFile.basename}` });
+		contentEl.createEl("p", { text: msg, cls: "setting-item-description" });
+	}
+
+	private async runSearch(): Promise<void> {
+		if (!this.plugin.settings.semantic.enabled) {
+			this.renderError(
+				"Semantic search is not enabled. Turn it on in Vault MCP settings and run Reindex first."
+			);
+			return;
+		}
+		const index = this.plugin.semanticIndex;
+		if (!index) {
+			this.renderError("Semantic index not initialized.");
+			return;
+		}
+		const results = await index.findRelatedNotes(this.sourceFile.path, {
+			limit: 15,
+			excludedPaths: this.plugin.settings.excludedPaths,
+		});
+		this.renderResults(results);
+	}
+
+	private renderResults(results: RelatedNote[]): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h3", { text: `Related to: ${this.sourceFile.basename}` });
+
+		if (results.length === 0) {
+			contentEl.createEl("p", {
+				text: "No related notes found.",
+				cls: "setting-item-description",
+			});
+			return;
+		}
+
+		contentEl.createEl("p", {
+			text: "Click a row to open. Cmd/Ctrl+click for new tab. Use Copy wikilink to link from your active note.",
+			cls: "setting-item-description",
+		});
+
+		const list = contentEl.createDiv();
+		for (const r of results) {
+			const row = list.createDiv({ cls: "related-row" });
+			const header = row.createDiv();
+			header.createSpan({ text: r.path, cls: "related-path" });
+			header.createSpan({
+				text: r.score.toFixed(3),
+				cls: "related-score",
+			});
+			if (r.snippet) {
+				row.createDiv({ text: r.snippet, cls: "related-snippet" });
+			}
+
+			const actions = row.createDiv({ cls: "related-actions" });
+			const copyBtn = actions.createEl("button", { text: "Copy wikilink" });
+			copyBtn.addEventListener("click", async (e) => {
+				e.stopPropagation();
+				await this.copyWikilink(r.path);
+			});
+
+			row.addEventListener("click", async (e) => {
+				if ((e.target as HTMLElement).tagName === "BUTTON") return;
+				const newLeaf = e.metaKey || e.ctrlKey;
+				const file = this.app.vault.getAbstractFileByPath(r.path);
+				if (!(file instanceof TFile)) return;
+				const leaf = newLeaf
+					? this.app.workspace.getLeaf("tab")
+					: this.app.workspace.getLeaf();
+				await leaf.openFile(file);
+				this.close();
+			});
+		}
+	}
+
+	private async copyWikilink(path: string): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) {
+			new Notice(`File not found: ${path}`);
+			return;
+		}
+		// Always emit wikilink format regardless of vault settings — matches
+		// the user's stated convention of never using markdown links.
+		const linktext = this.app.metadataCache.fileToLinktext(
+			file,
+			this.sourceFile.path,
+			file.extension === "md"
+		);
+		const wikilink = `[[${linktext}]]`;
+		await navigator.clipboard.writeText(wikilink);
+		new Notice(`Copied ${wikilink}`);
+	}
+}
+
 // Auto-reindex debounce. modify/create events fire on every Obsidian autosave
 // (~2s after typing stops). Re-embedding on every save chews main-thread time
 // for no perceptible search-quality gain, so coalesce per file: a quiet
@@ -283,6 +453,18 @@ export default class VaultMcpPlugin extends Plugin {
 			id: "compact-semantic-index",
 			name: "Semantic search: compact index (dedupe and rewrite)",
 			callback: () => this.compactSemanticIndex(),
+		});
+		this.addCommand({
+			id: "find-related-notes",
+			name: "Semantic search: find related notes for active file",
+			checkCallback: (checking: boolean) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || file.extension !== "md") return false;
+				if (!this.settings.semantic.enabled) return false;
+				if (checking) return true;
+				new RelatedNotesModal(this.app, this, file).open();
+				return true;
+			},
 		});
 	}
 

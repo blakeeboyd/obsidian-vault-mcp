@@ -307,6 +307,42 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 		},
 	},
 	{
+		name: "find_related_notes",
+		description:
+			"Note-driven semantic discovery: given a note's path, return other notes ranked by mean-pooled cosine similarity. Useful for finding wikilink candidates, surfacing forgotten neighbors, or cross-pollinating between Zettelkasten / synthesis branches. Mean pooling implicitly favors atomic notes; long multi-topic notes (lit notes, source files) will give muddier results. Requires semantic search to be enabled and indexed. Optionally returns chunk-pair evidence showing which passages drove each match.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				path: {
+					type: "string",
+					description:
+						"Path of the source note relative to vault root. Must already be in the semantic index.",
+				},
+				limit: {
+					type: "number",
+					description: "Maximum number of results to return (default: 10)",
+				},
+				filter: {
+					type: "string",
+					description:
+						"Optional path prefix to include (e.g., '10-19_Knowledge/11 Zettelkasten/' to find related zettels only)",
+				},
+				exclude_prefix: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						"Optional list of path prefixes to exclude from results (e.g., to skip source/lit folders when looking for synthesis neighbors)",
+				},
+				include_evidence: {
+					type: "boolean",
+					description:
+						"If true, include the most-similar chunk text from both the source and each candidate so you can see why two notes connect (default: false)",
+				},
+			},
+			required: ["path"],
+		},
+	},
+	{
 		name: "list_templates",
 		description:
 			"List available Templater templates. Requires the Templater plugin to be installed.",
@@ -1051,6 +1087,55 @@ async function handleSemanticSearch(
 	}
 }
 
+async function handleFindRelatedNotes(
+	ctx: ToolContext,
+	args: Record<string, unknown>
+): Promise<ToolResult> {
+	if (!ctx.semanticEnabled || !ctx.semanticIndex) {
+		return errorResult(
+			"Semantic search is disabled. Enable it in Vault MCP settings and run 'Reindex vault' first."
+		);
+	}
+
+	const path = normalizePath(String(args.path || ""));
+	if (!path) return errorResult("path is required");
+
+	const limit = typeof args.limit === "number" ? args.limit : 10;
+	const filter = args.filter ? String(args.filter) : undefined;
+	const excludePrefix = Array.isArray(args.exclude_prefix)
+		? args.exclude_prefix.map((p) => String(p))
+		: undefined;
+	const includeEvidence = Boolean(args.include_evidence);
+
+	try {
+		const results = await ctx.semanticIndex.findRelatedNotes(path, {
+			limit,
+			filter,
+			excludePrefix,
+			excludedPaths: ctx.excludedPaths,
+			includeEvidence,
+		});
+
+		if (results.length === 0) {
+			return textResult(`No related notes found for: ${path}`);
+		}
+
+		const formatted = results.map((r) => {
+			const score = r.score.toFixed(3);
+			let block = `${r.path}  (${score})\n  ${r.snippet}`;
+			if (includeEvidence && r.sourceChunkText !== undefined) {
+				block += `\n  Source chunk #${r.sourceChunkIndex}: ${r.sourceChunkText}`;
+				block += `\n  Match chunk #${r.candidateChunkIndex}: ${r.candidateChunkText}`;
+			}
+			return block;
+		});
+		return textResult(formatted.join("\n\n"));
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return errorResult(`Find related notes failed: ${msg}`);
+	}
+}
+
 async function handleListTemplates(
 	app: App
 ): Promise<ToolResult> {
@@ -1251,6 +1336,11 @@ export async function handleToolCall(
 			}
 			case "semantic_search":
 				return await handleSemanticSearch(ctx, args);
+			case "find_related_notes": {
+				const denied = checkAccess(normalizePath(String(args.path || "")));
+				if (denied) return denied;
+				return await handleFindRelatedNotes(ctx, args);
+			}
 			case "list_templates":
 				return await handleListTemplates(app);
 			case "create_from_template": {
