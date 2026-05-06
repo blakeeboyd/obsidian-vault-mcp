@@ -309,7 +309,11 @@ class RelatedNotesModal extends Modal {
 
 	private injectStyles(): void {
 		const id = "vault-mcp-related-styles";
-		if (document.getElementById(id)) return;
+		// Remove any existing style element from a previous plugin load.
+		// Without this, stale CSS from an older session blocks new rules
+		// from taking effect (the early-return check in the prior version
+		// hit the cached element and skipped reinjection).
+		document.getElementById(id)?.remove();
 		const style = document.createElement("style");
 		style.id = id;
 		style.textContent = `
@@ -327,13 +331,13 @@ class RelatedNotesModal extends Modal {
 			.vault-mcp-related-modal .related-header {
 				display: flex;
 				align-items: baseline;
-				gap: 10px;
 				flex-wrap: wrap;
 			}
 			.vault-mcp-related-modal .related-title {
 				font-weight: 600;
 				font-size: var(--font-ui-medium);
 				flex: 1 1 auto;
+				margin-right: 12px;
 			}
 			.vault-mcp-related-modal .related-subtitle {
 				color: var(--text-faint);
@@ -347,6 +351,7 @@ class RelatedNotesModal extends Modal {
 				text-transform: uppercase;
 				letter-spacing: 0.5px;
 				white-space: nowrap;
+				margin-right: 8px;
 			}
 			.vault-mcp-related-modal .related-band-strong {
 				color: #4ade80;
