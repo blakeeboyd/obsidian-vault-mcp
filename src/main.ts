@@ -494,12 +494,14 @@ class RelatedNotesModal extends Modal {
 		for (const r of results) {
 			const row = list.createDiv({ cls: "related-row" });
 
-			// Header: alias as title (path is opaque without it), score band,
-			// optional "linked" badge. Path moves to a muted subtitle below.
+			// Header: human-readable title (alias / frontmatter title / H1 /
+			// basename), score band, optional "linked" badge. Full path moves
+			// to a muted subtitle below for unambiguous reference.
 			const header = row.createDiv({ cls: "related-header" });
-			const titleText =
-				r.aliases && r.aliases.length > 0 ? r.aliases[0] : r.path;
-			header.createSpan({ text: titleText, cls: "related-title" });
+			header.createSpan({
+				text: this.resolveTitle(r),
+				cls: "related-title",
+			});
 
 			const band = scoreBandLabel(r.score);
 			const bandEl = header.createSpan({
@@ -604,6 +606,23 @@ class RelatedNotesModal extends Modal {
 				this.close();
 			});
 		}
+	}
+
+	// Pick a human-readable title via the fallback ladder. The full path
+	// stays as the subtitle, so even when this returns a basename the
+	// reader can still see exactly which file it is.
+	private resolveTitle(r: RelatedNote): string {
+		if (r.aliases && r.aliases.length > 0) return r.aliases[0];
+		const file = this.app.vault.getAbstractFileByPath(r.path);
+		if (!(file instanceof TFile)) return r.path;
+		const cache = this.app.metadataCache.getFileCache(file);
+		const titleField = cache?.frontmatter?.title;
+		if (typeof titleField === "string" && titleField.trim().length > 0) {
+			return titleField.trim();
+		}
+		const h1 = cache?.headings?.find((h) => h.level === 1)?.heading;
+		if (h1 && h1.trim().length > 0) return h1.trim();
+		return file.basename;
 	}
 
 	private renderSharedLinks(container: HTMLElement, paths: string[]): void {
