@@ -268,6 +268,21 @@ class RelatedNotesModal extends Modal {
 		this.renderHost.unload();
 	}
 
+	private headerText(): string {
+		const fm = this.app.metadataCache.getFileCache(this.sourceFile)?.frontmatter;
+		const raw = fm?.aliases ?? fm?.alias;
+		if (raw !== undefined && raw !== null) {
+			const list = Array.isArray(raw) ? raw : [raw];
+			const first = list
+				.map((v) => (typeof v === "string" ? v.trim() : String(v)))
+				.find((v) => v.length > 0);
+			if (first) {
+				return `Related to: ${this.sourceFile.basename} — ${first}`;
+			}
+		}
+		return `Related to: ${this.sourceFile.basename}`;
+	}
+
 	onOpen(): void {
 		this.modalEl.addClass("vault-mcp-related-modal");
 		this.injectStyles();
@@ -338,7 +353,7 @@ class RelatedNotesModal extends Modal {
 	private renderLoading(): void {
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.createEl("h3", { text: `Related to: ${this.sourceFile.basename}` });
+		contentEl.createEl("h3", { text: this.headerText() });
 		contentEl.createEl("p", {
 			text: "Searching…",
 			cls: "setting-item-description",
@@ -348,7 +363,7 @@ class RelatedNotesModal extends Modal {
 	private renderError(msg: string): void {
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.createEl("h3", { text: `Related to: ${this.sourceFile.basename}` });
+		contentEl.createEl("h3", { text: this.headerText() });
 		contentEl.createEl("p", { text: msg, cls: "setting-item-description" });
 	}
 
@@ -374,7 +389,7 @@ class RelatedNotesModal extends Modal {
 	private renderResults(results: RelatedNote[]): void {
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.createEl("h3", { text: `Related to: ${this.sourceFile.basename}` });
+		contentEl.createEl("h3", { text: this.headerText() });
 
 		if (results.length === 0) {
 			contentEl.createEl("p", {
