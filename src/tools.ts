@@ -1122,10 +1122,14 @@ async function handleFindRelatedNotes(
 
 		const formatted = results.map((r) => {
 			const score = r.score.toFixed(3);
-			let block = `${r.path}  (${score})\n  ${r.snippet}`;
+			let block = `${r.path}  (${score})`;
+			if (r.aliases && r.aliases.length > 0) {
+				block += `\n  aliases: ${r.aliases.join(", ")}`;
+			}
+			block += `\n  ${r.snippet}`;
 			if (includeEvidence && r.sourceChunkText !== undefined) {
 				block += `\n  Source chunk #${r.sourceChunkIndex}: ${r.sourceChunkText}`;
-				block += `\n  Match chunk #${r.candidateChunkIndex}: ${r.candidateChunkText}`;
+				block += `\n  Match chunk #${r.chunkIndex}: ${r.snippet}`;
 			}
 			return block;
 		});

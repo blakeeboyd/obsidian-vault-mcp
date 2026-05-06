@@ -5,6 +5,8 @@ import {
 	Setting,
 	Notice,
 	Modal,
+	MarkdownRenderer,
+	Component,
 	TFolder,
 	TFile,
 	TAbstractFile,
@@ -14,7 +16,7 @@ import { VaultMcpSettings, DEFAULT_SETTINGS, ToolToggles } from "./types";
 import { McpHttpServer } from "./server";
 import { handleMcpRequest } from "./handlers";
 import { TOOL_CATEGORIES } from "./tools";
-import { SemanticIndex, RelatedNote } from "./semantic";
+import { SemanticIndex, RelatedNote, chunkMarkdown } from "./semantic";
 
 const AUTO_PORT_TRIES = 10;
 
@@ -244,14 +246,26 @@ class ExcludedFoldersModal extends Modal {
 	}
 }
 
+// Cap on rendered chunk length per row. Full chunks can be 1500 chars;
+// rendering all of them would overwhelm the modal. 600 keeps rows scannable
+// while preserving paragraph structure that the flat preview loses.
+const RENDER_CHUNK_MAX_CHARS = 600;
+
 class RelatedNotesModal extends Modal {
 	private plugin: VaultMcpPlugin;
 	private sourceFile: TFile;
+	// Owns the lifecycle of MarkdownRenderer-mounted children so they
+	// unload cleanly when the modal closes.
+	private renderHost: Component = new Component();
 
 	constructor(app: App, plugin: VaultMcpPlugin, sourceFile: TFile) {
 		super(app);
 		this.plugin = plugin;
 		this.sourceFile = sourceFile;
+	}
+
+	onClose(): void {
+		this.renderHost.unload();
 	}
 
 	onOpen(): void {
@@ -289,10 +303,24 @@ class RelatedNotesModal extends Modal {
 				font-size: var(--font-smallest);
 				margin-left: 8px;
 			}
+			.vault-mcp-related-modal .related-aliases {
+				color: var(--text-muted);
+				font-size: var(--font-smallest);
+				margin-top: 2px;
+				font-style: italic;
+			}
 			.vault-mcp-related-modal .related-snippet {
 				color: var(--text-muted);
 				font-size: var(--font-ui-small);
 				margin-top: 4px;
+				border-left: 2px solid var(--background-modifier-border);
+				padding-left: 8px;
+			}
+			.vault-mcp-related-modal .related-snippet > *:first-child {
+				margin-top: 0;
+			}
+			.vault-mcp-related-modal .related-snippet > *:last-child {
+				margin-bottom: 0;
 			}
 			.vault-mcp-related-modal .related-actions {
 				margin-top: 6px;
@@ -362,6 +390,10 @@ class RelatedNotesModal extends Modal {
 		});
 
 		const list = contentEl.createDiv();
+		// Mount the render host so MarkdownRenderer.render has a Component
+		// ancestor to unload its bookkeeping into. Created in the constructor
+		// but loaded here to tie its lifecycle to result rendering.
+		this.renderHost.load();
 		for (const r of results) {
 			const row = list.createDiv({ cls: "related-row" });
 			const header = row.createDiv();
@@ -370,9 +402,20 @@ class RelatedNotesModal extends Modal {
 				text: r.score.toFixed(3),
 				cls: "related-score",
 			});
-			if (r.snippet) {
-				row.createDiv({ text: r.snippet, cls: "related-snippet" });
+
+			if (r.aliases && r.aliases.length > 0) {
+				row.createDiv({
+					text: `aliases: ${r.aliases.join(", ")}`,
+					cls: "related-aliases",
+				});
 			}
+
+			const snippetEl = row.createDiv({ cls: "related-snippet" });
+			this.renderChunkMarkdown(snippetEl, r).catch(() => {
+				// Fall back to flat snippet on any render failure.
+				snippetEl.empty();
+				snippetEl.setText(r.snippet);
+			});
 
 			const actions = row.createDiv({ cls: "related-actions" });
 			const copyBtn = actions.createEl("button", { text: "Copy wikilink" });
@@ -382,7 +425,11 @@ class RelatedNotesModal extends Modal {
 			});
 
 			row.addEventListener("click", async (e) => {
-				if ((e.target as HTMLElement).tagName === "BUTTON") return;
+				const target = e.target as HTMLElement;
+				// Don't navigate when clicking inside the rendered snippet
+				// (which has its own clickable wikilinks) or buttons.
+				if (target.tagName === "BUTTON") return;
+				if (target.closest(".related-snippet")) return;
 				const newLeaf = e.metaKey || e.ctrlKey;
 				const file = this.app.vault.getAbstractFileByPath(r.path);
 				if (!(file instanceof TFile)) return;
@@ -393,6 +440,38 @@ class RelatedNotesModal extends Modal {
 				this.close();
 			});
 		}
+	}
+
+	private async renderChunkMarkdown(
+		el: HTMLElement,
+		r: RelatedNote
+	): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(r.path);
+		if (!(file instanceof TFile)) {
+			el.setText(r.snippet);
+			return;
+		}
+		const content = await this.app.vault.cachedRead(file);
+		const chunks = chunkMarkdown(r.path, content);
+		const raw = chunks[r.chunkIndex] ?? chunks[0];
+		if (!raw) {
+			el.setText(r.snippet);
+			return;
+		}
+		// chunkMarkdown prepends `${path}\n\n` as weak title context for the
+		// embedder. Strip it before rendering so the user sees just body text.
+		const body = raw.replace(/^[^\n]+\n\n/, "");
+		const truncated =
+			body.length > RENDER_CHUNK_MAX_CHARS
+				? body.slice(0, RENDER_CHUNK_MAX_CHARS) + "…"
+				: body;
+		await MarkdownRenderer.render(
+			this.app,
+			truncated,
+			el,
+			r.path,
+			this.renderHost
+		);
 	}
 
 	private async copyWikilink(path: string): Promise<void> {

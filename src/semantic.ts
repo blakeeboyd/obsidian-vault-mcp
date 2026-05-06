@@ -28,10 +28,16 @@ export interface RelatedNote {
 	path: string;
 	score: number;
 	snippet: string;
+	// Always set — identifies which candidate chunk drove the match.
+	// Lets clients (e.g. the modal) re-derive the full chunk text via
+	// chunkMarkdown without persisting the body in the index.
+	chunkIndex: number;
+	// Frontmatter aliases for the candidate file, if any.
+	aliases?: string[];
+	// include_evidence extras — the source chunk most aligned with the
+	// candidate vector, paired with the candidate's snippet.
 	sourceChunkIndex?: number;
 	sourceChunkText?: string;
-	candidateChunkIndex?: number;
-	candidateChunkText?: string;
 }
 
 export interface SemanticStatus {
@@ -725,11 +731,15 @@ export class SemanticIndex {
 				}
 			}
 
+			const aliases = this.readAliases(c.path);
+
 			const result: RelatedNote = {
 				path: c.path,
 				score: c.score,
 				snippet: bestCandPreview,
+				chunkIndex: bestCandIdx,
 			};
+			if (aliases && aliases.length > 0) result.aliases = aliases;
 
 			if (opts.includeEvidence) {
 				// Best source chunk wrt candidate vector — the other half of
@@ -747,12 +757,24 @@ export class SemanticIndex {
 				}
 				result.sourceChunkIndex = bestSrcIdx;
 				result.sourceChunkText = bestSrcPreview;
-				result.candidateChunkIndex = bestCandIdx;
-				result.candidateChunkText = bestCandPreview;
 			}
 
 			return result;
 		});
+	}
+
+	private readAliases(path: string): string[] | null {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return null;
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+		if (!fm) return null;
+		const raw = fm.aliases ?? fm.alias;
+		if (raw === undefined || raw === null) return null;
+		const list = Array.isArray(raw) ? raw : [raw];
+		const aliases = list
+			.map((v) => (typeof v === "string" ? v.trim() : String(v)))
+			.filter((v) => v.length > 0);
+		return aliases.length > 0 ? aliases : null;
 	}
 
 	async search(
