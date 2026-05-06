@@ -1087,6 +1087,17 @@ async function handleSemanticSearch(
 	}
 }
 
+// Coarse cosine bands. Picked to match how BGE micro v2 cosine
+// distributions look in practice: most "related" results sit between
+// 0.55 and 0.85, with strong matches above. Bands give the reader a
+// label they can grasp without doing arithmetic on the raw score.
+function scoreBand(score: number): string {
+	if (score >= 0.85) return "strong";
+	if (score >= 0.7) return "moderate";
+	if (score >= 0.55) return "loose";
+	return "weak";
+}
+
 async function handleFindRelatedNotes(
 	ctx: ToolContext,
 	args: Record<string, unknown>
@@ -1122,11 +1133,28 @@ async function handleFindRelatedNotes(
 
 		const formatted = results.map((r) => {
 			const score = r.score.toFixed(3);
-			let block = `${r.path}  (${score})`;
+			const band = scoreBand(r.score);
+			let block = `${r.path}  (${band} · ${score})`;
 			if (r.aliases && r.aliases.length > 0) {
 				block += `\n  aliases: ${r.aliases.join(", ")}`;
 			}
-			block += `\n  ${r.snippet}`;
+			// Prefer the authored caption when present; chunk excerpt
+			// otherwise. Authored summary tells the reader what the file
+			// is about; chunk excerpt only describes one passage.
+			const caption = r.summary ?? r.snippet;
+			block += `\n  ${caption}`;
+			if (r.sharedLinks && r.sharedLinks.length > 0) {
+				const refs = r.sharedLinks
+					.map((p) => `[[${p.replace(/\.md$/, "")}]]`)
+					.join(", ");
+				block += `\n  shared links: ${refs}`;
+			}
+			if (r.sharedTags && r.sharedTags.length > 0) {
+				block += `\n  shared tags: ${r.sharedTags.join(", ")}`;
+			}
+			if (r.directLink) {
+				block += `\n  direct link: ${r.directLink}`;
+			}
 			if (includeEvidence && r.sourceChunkText !== undefined) {
 				block += `\n  Source chunk #${r.sourceChunkIndex}: ${r.sourceChunkText}`;
 				block += `\n  Match chunk #${r.chunkIndex}: ${r.snippet}`;

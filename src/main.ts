@@ -251,6 +251,20 @@ class ExcludedFoldersModal extends Modal {
 // while preserving paragraph structure that the flat preview loses.
 const RENDER_CHUNK_MAX_CHARS = 600;
 
+// Cosine-similarity bands for the modal's at-a-glance score indicator.
+// Thresholds match the MCP-side scoreBand function so both surfaces
+// describe the same result the same way.
+function scoreBandLabel(score: number): {
+	key: "strong" | "moderate" | "loose" | "weak";
+	label: string;
+	dots: number;
+} {
+	if (score >= 0.85) return { key: "strong", label: "strong", dots: 3 };
+	if (score >= 0.7) return { key: "moderate", label: "moderate", dots: 2 };
+	if (score >= 0.55) return { key: "loose", label: "loose", dots: 1 };
+	return { key: "weak", label: "weak", dots: 0 };
+}
+
 class RelatedNotesModal extends Modal {
 	private plugin: VaultMcpPlugin;
 	private sourceFile: TFile;
@@ -324,6 +338,11 @@ class RelatedNotesModal extends Modal {
 				margin-top: 2px;
 				font-style: italic;
 			}
+			.vault-mcp-related-modal .related-summary {
+				margin-top: 6px;
+				color: var(--text-normal);
+				font-size: var(--font-ui-small);
+			}
 			.vault-mcp-related-modal .related-snippet {
 				color: var(--text-muted);
 				font-size: var(--font-ui-small);
@@ -336,6 +355,43 @@ class RelatedNotesModal extends Modal {
 			}
 			.vault-mcp-related-modal .related-snippet > *:last-child {
 				margin-bottom: 0;
+			}
+			.vault-mcp-related-modal .related-shared {
+				margin-top: 6px;
+				font-size: var(--font-smallest);
+				color: var(--text-muted);
+				display: flex;
+				flex-wrap: wrap;
+				gap: 8px;
+			}
+			.vault-mcp-related-modal .related-shared-label {
+				font-weight: 500;
+			}
+			.vault-mcp-related-modal .related-link-badge {
+				display: inline-block;
+				font-size: var(--font-smallest);
+				padding: 1px 6px;
+				border-radius: 3px;
+				background: var(--background-modifier-success);
+				color: var(--text-on-accent);
+				margin-left: 6px;
+			}
+			.vault-mcp-related-modal .related-band {
+				font-size: var(--font-smallest);
+				margin-left: 8px;
+				letter-spacing: 1px;
+			}
+			.vault-mcp-related-modal .related-band-strong {
+				color: var(--color-green);
+			}
+			.vault-mcp-related-modal .related-band-moderate {
+				color: var(--color-yellow);
+			}
+			.vault-mcp-related-modal .related-band-loose {
+				color: var(--text-muted);
+			}
+			.vault-mcp-related-modal .related-band-weak {
+				color: var(--text-faint);
 			}
 			.vault-mcp-related-modal .related-actions {
 				margin-top: 6px;
@@ -413,10 +469,24 @@ class RelatedNotesModal extends Modal {
 			const row = list.createDiv({ cls: "related-row" });
 			const header = row.createDiv();
 			header.createSpan({ text: r.path, cls: "related-path" });
-			header.createSpan({
-				text: r.score.toFixed(3),
-				cls: "related-score",
+			const band = scoreBandLabel(r.score);
+			const bandEl = header.createSpan({
+				text: `●●●`.slice(0, band.dots) + `○○○`.slice(band.dots),
+				cls: `related-band related-band-${band.key}`,
 			});
+			bandEl.title = `${band.label} (${r.score.toFixed(3)})`;
+			if (r.directLink) {
+				const arrow =
+					r.directLink === "outgoing"
+						? "→"
+						: r.directLink === "incoming"
+							? "←"
+							: "↔";
+				header.createSpan({
+					text: `${arrow} linked`,
+					cls: "related-link-badge",
+				});
+			}
 
 			if (r.aliases && r.aliases.length > 0) {
 				row.createDiv({
@@ -425,12 +495,40 @@ class RelatedNotesModal extends Modal {
 				});
 			}
 
-			const snippetEl = row.createDiv({ cls: "related-snippet" });
-			this.renderChunkMarkdown(snippetEl, r).catch(() => {
-				// Fall back to flat snippet on any render failure.
-				snippetEl.empty();
-				snippetEl.setText(r.snippet);
-			});
+			// Summary takes precedence over the chunk render — it's the
+			// authored caption, not a body excerpt.
+			if (r.summary) {
+				row.createDiv({ text: r.summary, cls: "related-summary" });
+			} else {
+				const snippetEl = row.createDiv({ cls: "related-snippet" });
+				this.renderChunkMarkdown(snippetEl, r).catch(() => {
+					snippetEl.empty();
+					snippetEl.setText(r.snippet);
+				});
+			}
+
+			if (
+				(r.sharedLinks && r.sharedLinks.length > 0) ||
+				(r.sharedTags && r.sharedTags.length > 0)
+			) {
+				const sharedEl = row.createDiv({ cls: "related-shared" });
+				if (r.sharedLinks && r.sharedLinks.length > 0) {
+					const part = sharedEl.createSpan();
+					part.createSpan({
+						text: "shared: ",
+						cls: "related-shared-label",
+					});
+					this.renderSharedLinks(part, r.sharedLinks);
+				}
+				if (r.sharedTags && r.sharedTags.length > 0) {
+					const part = sharedEl.createSpan();
+					part.createSpan({
+						text: "tags: ",
+						cls: "related-shared-label",
+					});
+					part.createSpan({ text: r.sharedTags.join(", ") });
+				}
+			}
 
 			const actions = row.createDiv({ cls: "related-actions" });
 			const copyBtn = actions.createEl("button", { text: "Copy wikilink" });
@@ -455,6 +553,45 @@ class RelatedNotesModal extends Modal {
 				this.close();
 			});
 		}
+	}
+
+	private renderSharedLinks(container: HTMLElement, paths: string[]): void {
+		paths.forEach((p, i) => {
+			if (i > 0) container.appendText(", ");
+			const file = this.app.vault.getAbstractFileByPath(p);
+			if (file instanceof TFile) {
+				const linktext = this.app.metadataCache.fileToLinktext(
+					file,
+					this.sourceFile.path,
+					true
+				);
+				const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+				const aliases = fm?.aliases ?? fm?.alias;
+				let display = linktext;
+				if (Array.isArray(aliases) && aliases.length > 0) {
+					display = String(aliases[0]);
+				} else if (typeof aliases === "string") {
+					display = aliases;
+				}
+				const link = container.createEl("a", {
+					text: display,
+					cls: "internal-link",
+					href: linktext,
+				});
+				link.addEventListener("click", async (e) => {
+					e.preventDefault();
+					e.stopPropagation();
+					const newLeaf = e.metaKey || e.ctrlKey;
+					const leaf = newLeaf
+						? this.app.workspace.getLeaf("tab")
+						: this.app.workspace.getLeaf();
+					await leaf.openFile(file);
+					this.close();
+				});
+			} else {
+				container.appendText(p);
+			}
+		});
 	}
 
 	private async renderChunkMarkdown(

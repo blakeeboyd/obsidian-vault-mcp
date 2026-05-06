@@ -1,4 +1,4 @@
-import { App, TFile, Notice, DataAdapter } from "obsidian";
+import { App, TFile, Notice, DataAdapter, getAllTags } from "obsidian";
 import { buildEmbedderIframeScript } from "./embedder-iframe";
 
 // Self-contained semantic search. Transformers.js runs inside a hidden
@@ -34,6 +34,18 @@ export interface RelatedNote {
 	chunkIndex: number;
 	// Frontmatter aliases for the candidate file, if any.
 	aliases?: string[];
+	// One-line caption from frontmatter (summary / statement / description).
+	// Replaces the chunk excerpt in clients when present — body text is a
+	// noisier signal than an authored caption.
+	summary?: string;
+	// Targets that both source and candidate link to, capped to 5. The
+	// strongest "why related" signal: it's a connection you already drew.
+	sharedLinks?: string[];
+	// Tags (with # prefix) carried by both files, capped to 5.
+	sharedTags?: string[];
+	// Whether source and candidate already link to each other directly.
+	// "outgoing" = source → candidate, "incoming" = candidate → source.
+	directLink?: "outgoing" | "incoming" | "bidirectional";
 	// include_evidence extras — the source chunk most aligned with the
 	// candidate vector, paired with the candidate's snippet.
 	sourceChunkIndex?: number;
@@ -714,6 +726,9 @@ export class SemanticIndex {
 		const top = candidates.slice(0, opts.limit);
 
 		const sourceEntries = this.byPath.get(sourcePath) || [];
+		// Compute source-side connection signals once; reuse across candidates.
+		const sourceLinks = this.outgoingLinks(sourcePath);
+		const sourceTags = this.fileTags(sourcePath);
 
 		return top.map((c) => {
 			const candEntries = this.byPath.get(c.path) || [];
@@ -732,6 +747,30 @@ export class SemanticIndex {
 			}
 
 			const aliases = this.readAliases(c.path);
+			const summary = this.readSummary(c.path);
+			const candLinks = this.outgoingLinks(c.path);
+			const candTags = this.fileTags(c.path);
+
+			// Shared third-party links: targets that both source and candidate
+			// link to. Exclude the source/candidate themselves so "shared"
+			// means "shared third-party concept," not "they link to each other."
+			const sharedLinksAll: string[] = [];
+			for (const link of sourceLinks) {
+				if (link === c.path || link === sourcePath) continue;
+				if (candLinks.has(link)) sharedLinksAll.push(link);
+			}
+			const sharedTagsAll: string[] = [];
+			for (const tag of sourceTags) {
+				if (candTags.has(tag)) sharedTagsAll.push(tag);
+			}
+
+			// Direct link between source and candidate, if any.
+			const sToC = sourceLinks.has(c.path);
+			const cToS = candLinks.has(sourcePath);
+			let directLink: RelatedNote["directLink"] | undefined;
+			if (sToC && cToS) directLink = "bidirectional";
+			else if (sToC) directLink = "outgoing";
+			else if (cToS) directLink = "incoming";
 
 			const result: RelatedNote = {
 				path: c.path,
@@ -740,6 +779,14 @@ export class SemanticIndex {
 				chunkIndex: bestCandIdx,
 			};
 			if (aliases && aliases.length > 0) result.aliases = aliases;
+			if (summary) result.summary = summary;
+			if (sharedLinksAll.length > 0) {
+				result.sharedLinks = sharedLinksAll.slice(0, 5);
+			}
+			if (sharedTagsAll.length > 0) {
+				result.sharedTags = sharedTagsAll.slice(0, 5);
+			}
+			if (directLink) result.directLink = directLink;
 
 			if (opts.includeEvidence) {
 				// Best source chunk wrt candidate vector — the other half of
@@ -775,6 +822,37 @@ export class SemanticIndex {
 			.map((v) => (typeof v === "string" ? v.trim() : String(v)))
 			.filter((v) => v.length > 0);
 		return aliases.length > 0 ? aliases : null;
+	}
+
+	// Frontmatter caption ladder. Different note conventions surface their
+	// "what is this" line under different keys; check the common ones.
+	private readSummary(path: string): string | undefined {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return undefined;
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+		if (!fm) return undefined;
+		for (const field of ["summary", "statement", "description"]) {
+			const v = fm[field];
+			if (typeof v === "string" && v.trim().length > 0) {
+				return v.trim();
+			}
+		}
+		return undefined;
+	}
+
+	private outgoingLinks(path: string): Set<string> {
+		const links = this.app.metadataCache.resolvedLinks[path];
+		if (!links) return new Set();
+		return new Set(Object.keys(links));
+	}
+
+	private fileTags(path: string): Set<string> {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return new Set();
+		const cache = this.app.metadataCache.getFileCache(file);
+		if (!cache) return new Set();
+		const tags = getAllTags(cache);
+		return new Set(tags || []);
 	}
 
 	async search(
