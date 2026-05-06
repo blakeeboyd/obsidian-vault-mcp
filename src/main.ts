@@ -314,41 +314,85 @@ class RelatedNotesModal extends Modal {
 		style.id = id;
 		style.textContent = `
 			.vault-mcp-related-modal .related-row {
-				padding: 8px 12px;
+				padding: 12px 14px;
 				cursor: pointer;
-				border-radius: 4px;
-				margin-bottom: 4px;
-				border: 1px solid transparent;
+				border-radius: 6px;
+				margin-bottom: 10px;
+				border: 1px solid var(--background-modifier-border);
+				background: var(--background-secondary);
 			}
 			.vault-mcp-related-modal .related-row:hover {
 				background: var(--background-modifier-hover);
-				border-color: var(--background-modifier-border);
 			}
-			.vault-mcp-related-modal .related-path {
-				font-weight: 500;
+			.vault-mcp-related-modal .related-header {
+				display: flex;
+				align-items: baseline;
+				gap: 10px;
+				flex-wrap: wrap;
 			}
-			.vault-mcp-related-modal .related-score {
-				color: var(--text-muted);
+			.vault-mcp-related-modal .related-title {
+				font-weight: 600;
+				font-size: var(--font-ui-medium);
+				flex: 1 1 auto;
+			}
+			.vault-mcp-related-modal .related-subtitle {
+				color: var(--text-faint);
 				font-size: var(--font-smallest);
-				margin-left: 8px;
+				font-family: var(--font-monospace);
+				margin-top: 2px;
 			}
-			.vault-mcp-related-modal .related-aliases {
+			.vault-mcp-related-modal .related-band {
+				font-size: var(--font-smallest);
+				font-weight: 500;
+				text-transform: uppercase;
+				letter-spacing: 0.5px;
+				white-space: nowrap;
+			}
+			.vault-mcp-related-modal .related-band-strong {
+				color: #4ade80;
+			}
+			.vault-mcp-related-modal .related-band-moderate {
+				color: #facc15;
+			}
+			.vault-mcp-related-modal .related-band-loose {
+				color: var(--text-muted);
+			}
+			.vault-mcp-related-modal .related-band-weak {
+				color: var(--text-faint);
+			}
+			.vault-mcp-related-modal .related-link-badge {
+				font-size: var(--font-smallest);
+				padding: 2px 8px;
+				border-radius: 10px;
+				background: var(--interactive-accent);
+				color: var(--text-on-accent);
+				white-space: nowrap;
+			}
+			.vault-mcp-related-modal .related-aka {
 				color: var(--text-muted);
 				font-size: var(--font-smallest);
 				margin-top: 2px;
 				font-style: italic;
 			}
 			.vault-mcp-related-modal .related-summary {
-				margin-top: 6px;
+				margin-top: 8px;
 				color: var(--text-normal);
 				font-size: var(--font-ui-small);
+				line-height: 1.5;
+			}
+			.vault-mcp-related-modal .related-summary > *:first-child {
+				margin-top: 0;
+			}
+			.vault-mcp-related-modal .related-summary > *:last-child {
+				margin-bottom: 0;
 			}
 			.vault-mcp-related-modal .related-snippet {
 				color: var(--text-muted);
 				font-size: var(--font-ui-small);
-				margin-top: 4px;
+				margin-top: 8px;
 				border-left: 2px solid var(--background-modifier-border);
-				padding-left: 8px;
+				padding-left: 10px;
+				line-height: 1.5;
 			}
 			.vault-mcp-related-modal .related-snippet > *:first-child {
 				margin-top: 0;
@@ -357,50 +401,27 @@ class RelatedNotesModal extends Modal {
 				margin-bottom: 0;
 			}
 			.vault-mcp-related-modal .related-shared {
-				margin-top: 6px;
+				margin-top: 10px;
+				padding-top: 8px;
+				border-top: 1px solid var(--background-modifier-border);
 				font-size: var(--font-smallest);
 				color: var(--text-muted);
 				display: flex;
 				flex-wrap: wrap;
-				gap: 8px;
+				gap: 12px;
 			}
 			.vault-mcp-related-modal .related-shared-label {
 				font-weight: 500;
-			}
-			.vault-mcp-related-modal .related-link-badge {
-				display: inline-block;
-				font-size: var(--font-smallest);
-				padding: 1px 6px;
-				border-radius: 3px;
-				background: var(--background-modifier-success);
-				color: var(--text-on-accent);
-				margin-left: 6px;
-			}
-			.vault-mcp-related-modal .related-band {
-				font-size: var(--font-smallest);
-				margin-left: 8px;
-				letter-spacing: 1px;
-			}
-			.vault-mcp-related-modal .related-band-strong {
-				color: var(--color-green);
-			}
-			.vault-mcp-related-modal .related-band-moderate {
-				color: var(--color-yellow);
-			}
-			.vault-mcp-related-modal .related-band-loose {
-				color: var(--text-muted);
-			}
-			.vault-mcp-related-modal .related-band-weak {
 				color: var(--text-faint);
 			}
 			.vault-mcp-related-modal .related-actions {
-				margin-top: 6px;
+				margin-top: 10px;
 				display: flex;
 				gap: 6px;
 			}
 			.vault-mcp-related-modal .related-actions button {
 				font-size: var(--font-smallest);
-				padding: 2px 8px;
+				padding: 3px 10px;
 			}
 		`;
 		document.head.appendChild(style);
@@ -467,14 +488,21 @@ class RelatedNotesModal extends Modal {
 		this.renderHost.load();
 		for (const r of results) {
 			const row = list.createDiv({ cls: "related-row" });
-			const header = row.createDiv();
-			header.createSpan({ text: r.path, cls: "related-path" });
+
+			// Header: alias as title (path is opaque without it), score band,
+			// optional "linked" badge. Path moves to a muted subtitle below.
+			const header = row.createDiv({ cls: "related-header" });
+			const titleText =
+				r.aliases && r.aliases.length > 0 ? r.aliases[0] : r.path;
+			header.createSpan({ text: titleText, cls: "related-title" });
+
 			const band = scoreBandLabel(r.score);
 			const bandEl = header.createSpan({
-				text: `●●●`.slice(0, band.dots) + `○○○`.slice(band.dots),
+				text: band.label,
 				cls: `related-band related-band-${band.key}`,
 			});
-			bandEl.title = `${band.label} (${r.score.toFixed(3)})`;
+			bandEl.title = `cosine ${r.score.toFixed(3)}`;
+
 			if (r.directLink) {
 				const arrow =
 					r.directLink === "outgoing"
@@ -488,17 +516,31 @@ class RelatedNotesModal extends Modal {
 				});
 			}
 
-			if (r.aliases && r.aliases.length > 0) {
+			// Subtitle: path (always shown for unambiguous reference) plus any
+			// additional aliases beyond the title one, kept compact.
+			const subtitle = row.createDiv({ cls: "related-subtitle" });
+			subtitle.setText(r.path);
+			if (r.aliases && r.aliases.length > 1) {
 				row.createDiv({
-					text: `aliases: ${r.aliases.join(", ")}`,
-					cls: "related-aliases",
+					text: `also: ${r.aliases.slice(1).join(", ")}`,
+					cls: "related-aka",
 				});
 			}
 
-			// Summary takes precedence over the chunk render — it's the
-			// authored caption, not a body excerpt.
+			// Summary (rendered) when present, chunk excerpt otherwise.
+			// Both go through MarkdownRenderer so wikilinks are clickable.
 			if (r.summary) {
-				row.createDiv({ text: r.summary, cls: "related-summary" });
+				const summaryEl = row.createDiv({ cls: "related-summary" });
+				MarkdownRenderer.render(
+					this.app,
+					r.summary,
+					summaryEl,
+					r.path,
+					this.renderHost
+				).catch(() => {
+					summaryEl.empty();
+					summaryEl.setText(r.summary!);
+				});
 			} else {
 				const snippetEl = row.createDiv({ cls: "related-snippet" });
 				this.renderChunkMarkdown(snippetEl, r).catch(() => {
@@ -539,10 +581,14 @@ class RelatedNotesModal extends Modal {
 
 			row.addEventListener("click", async (e) => {
 				const target = e.target as HTMLElement;
-				// Don't navigate when clicking inside the rendered snippet
-				// (which has its own clickable wikilinks) or buttons.
+				// Don't navigate when the click was inside a region that
+				// owns its own click semantics (rendered wikilinks, buttons,
+				// the shared-concepts row).
 				if (target.tagName === "BUTTON") return;
+				if (target.tagName === "A") return;
 				if (target.closest(".related-snippet")) return;
+				if (target.closest(".related-summary")) return;
+				if (target.closest(".related-shared")) return;
 				const newLeaf = e.metaKey || e.ctrlKey;
 				const file = this.app.vault.getAbstractFileByPath(r.path);
 				if (!(file instanceof TFile)) return;
