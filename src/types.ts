@@ -34,10 +34,7 @@ export interface ToolToggles {
 	list_files: boolean;
 	read_file: boolean;
 	write_file: boolean;
-	// No DEFAULT_SETTINGS entry and no settings-tab toggle: getEnabledTools
-	// filters on `!== false`, so an absent key leaves the tool on. Matches the
-	// shipped 2026-07-03 build. Add both if it ever needs to be switchable.
-	append_to_file?: boolean;
+	append_to_file: boolean;
 	find_backlinks: boolean;
 	search_vault: boolean;
 	query_frontmatter: boolean;
@@ -89,6 +86,7 @@ export const DEFAULT_SETTINGS: VaultMcpSettings = {
 		list_files: true,
 		read_file: true,
 		write_file: true,
+		append_to_file: true,
 		find_backlinks: true,
 		search_vault: true,
 		query_frontmatter: true,

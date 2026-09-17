@@ -10,6 +10,7 @@ import {
 	TFolder,
 	TFile,
 	TAbstractFile,
+	Editor,
 	normalizePath,
 } from "obsidian";
 import { VaultMcpSettings, DEFAULT_SETTINGS, ToolToggles } from "./types";
@@ -274,15 +275,29 @@ function scoreBandLabel(score: number): {
 
 class RelatedNotesModal extends Modal {
 	private plugin: VaultMcpPlugin;
-	private sourceFile: TFile;
+	// Exactly one of these is set: the modal either explains a file's neighbours
+	// or answers a free-text query from the editor selection.
+	private sourceFile: TFile | null;
+	private query: string | null;
 	// Owns the lifecycle of MarkdownRenderer-mounted children so they
 	// unload cleanly when the modal closes.
 	private renderHost: Component = new Component();
 
-	constructor(app: App, plugin: VaultMcpPlugin, sourceFile: TFile) {
+	constructor(
+		app: App,
+		plugin: VaultMcpPlugin,
+		source: { file: TFile } | { query: string }
+	) {
 		super(app);
 		this.plugin = plugin;
-		this.sourceFile = sourceFile;
+		this.sourceFile = "file" in source ? source.file : null;
+		this.query = "query" in source ? source.query : null;
+	}
+
+	// "From" path for relative link resolution: the source file when we have
+	// one, else the active file, else "" (root — still yields a usable link).
+	private linkFromPath(): string {
+		return this.sourceFile?.path ?? this.app.workspace.getActiveFile()?.path ?? "";
 	}
 
 	onClose(): void {
@@ -290,7 +305,13 @@ class RelatedNotesModal extends Modal {
 	}
 
 	private headerText(): string {
-		const fm = this.app.metadataCache.getFileCache(this.sourceFile)?.frontmatter;
+		if (this.query !== null) {
+			const trimmed = this.query.replace(/\s+/g, " ").trim();
+			const preview = trimmed.length > 60 ? trimmed.slice(0, 60) + "…" : trimmed;
+			return `Related to selection: "${preview}"`;
+		}
+		const source = this.sourceFile as TFile;
+		const fm = this.app.metadataCache.getFileCache(source)?.frontmatter;
 		const raw = fm?.aliases ?? fm?.alias;
 		if (raw !== undefined && raw !== null) {
 			const list = Array.isArray(raw) ? raw : [raw];
@@ -298,10 +319,10 @@ class RelatedNotesModal extends Modal {
 				.map((v) => (typeof v === "string" ? v.trim() : String(v)))
 				.find((v) => v.length > 0);
 			if (first) {
-				return `Related to: ${this.sourceFile.basename} — ${first}`;
+				return `Related to: ${source.basename} — ${first}`;
 			}
 		}
-		return `Related to: ${this.sourceFile.basename}`;
+		return `Related to: ${source.basename}`;
 	}
 
 	onOpen(): void {
@@ -324,6 +345,12 @@ class RelatedNotesModal extends Modal {
 		const style = document.createElement("style");
 		style.id = id;
 		style.textContent = `
+			/* Scroll inside the modal so a tall result list stays within the
+			   rounded corners instead of overflowing past them. */
+			.vault-mcp-related-modal .modal-content {
+				max-height: 70vh;
+				overflow-y: auto;
+			}
 			.vault-mcp-related-modal .related-row {
 				padding: 12px 14px;
 				cursor: pointer;
@@ -468,7 +495,23 @@ class RelatedNotesModal extends Modal {
 			this.renderError("Semantic index not initialized.");
 			return;
 		}
-		const results = await index.findRelatedNotes(this.sourceFile.path, {
+		if (this.query !== null) {
+			const hits = await index.search(this.query, {
+				limit: 15,
+				excludedPaths: this.plugin.settings.excludedPaths,
+			});
+			this.renderResults(
+				hits.map((h) => ({
+					path: h.path,
+					score: h.score,
+					snippet: h.snippet,
+					chunkIndex: h.chunkIndex,
+				}))
+			);
+			return;
+		}
+
+		const results = await index.findRelatedNotes((this.sourceFile as TFile).path, {
 			limit: 15,
 			excludedPaths: this.plugin.settings.excludedPaths,
 		});
@@ -639,7 +682,7 @@ class RelatedNotesModal extends Modal {
 			if (file instanceof TFile) {
 				const linktext = this.app.metadataCache.fileToLinktext(
 					file,
-					this.sourceFile.path,
+					this.linkFromPath(),
 					true
 				);
 				const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
@@ -713,7 +756,7 @@ class RelatedNotesModal extends Modal {
 		// the user's stated convention of never using markdown links.
 		const linktext = this.app.metadataCache.fileToLinktext(
 			file,
-			this.sourceFile.path,
+			this.linkFromPath(),
 			file.extension === "md"
 		);
 		const wikilink = `[[${linktext}]]`;
@@ -774,7 +817,19 @@ export default class VaultMcpPlugin extends Plugin {
 				if (!file || file.extension !== "md") return false;
 				if (!this.settings.semantic.enabled) return false;
 				if (checking) return true;
-				new RelatedNotesModal(this.app, this, file).open();
+				new RelatedNotesModal(this.app, this, { file }).open();
+				return true;
+			},
+		});
+		this.addCommand({
+			id: "find-related-to-selection",
+			name: "Semantic search: find related notes for selection",
+			editorCheckCallback: (checking: boolean, editor: Editor) => {
+				if (!this.settings.semantic.enabled) return false;
+				const selection = editor.getSelection();
+				if (!selection.trim()) return false;
+				if (checking) return true;
+				new RelatedNotesModal(this.app, this, { query: selection }).open();
 				return true;
 			},
 		});
@@ -1156,7 +1211,7 @@ class VaultMcpSettingTab extends PluginSettingTab {
 					.setDesc(label.desc)
 					.addToggle((toggle) =>
 						toggle
-							.setValue(this.plugin.settings.enabledTools[toolName] !== false)
+							.setValue(this.plugin.settings.enabledTools[toolName])
 							.onChange(async (value) => {
 								this.plugin.settings.enabledTools[toolName] = value;
 								await this.plugin.saveSettings();

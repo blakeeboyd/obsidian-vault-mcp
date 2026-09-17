@@ -633,6 +633,10 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
 				name: "Patch Content",
 				desc: "Insert or replace content at a specific location",
 			},
+			append_to_file: {
+				name: "Append to File",
+				desc: "Append text transactionally, so Relay-synced files propagate",
+			},
 			open_file: {
 				name: "Open File",
 				desc: "Open a file in the Obsidian editor",
