@@ -34,6 +34,10 @@ export interface ToolToggles {
 	list_files: boolean;
 	read_file: boolean;
 	write_file: boolean;
+	// No DEFAULT_SETTINGS entry and no settings-tab toggle: getEnabledTools
+	// filters on `!== false`, so an absent key leaves the tool on. Matches the
+	// shipped 2026-07-03 build. Add both if it ever needs to be switchable.
+	append_to_file?: boolean;
 	find_backlinks: boolean;
 	search_vault: boolean;
 	query_frontmatter: boolean;
@@ -48,6 +52,12 @@ export interface ToolToggles {
 	list_templates: boolean;
 	create_from_template: boolean;
 	get_vault_info: boolean;
+	read_console: boolean;
+	clear_console: boolean;
+	list_plugins: boolean;
+	set_plugin_enabled: boolean;
+	list_commands: boolean;
+	run_command: boolean;
 }
 
 export interface SemanticSettings {
@@ -93,6 +103,12 @@ export const DEFAULT_SETTINGS: VaultMcpSettings = {
 		list_templates: true,
 		create_from_template: true,
 		get_vault_info: true,
+		read_console: true,
+		clear_console: true,
+		list_plugins: true,
+		set_plugin_enabled: true,
+		list_commands: true,
+		run_command: true,
 	},
 	excludedPaths: [],
 	semantic: {

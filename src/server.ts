@@ -60,14 +60,14 @@ export class McpHttpServer {
 		// Only handle POST /mcp
 		const url = new URL(req.url || "/", `http://127.0.0.1:${this.port}`);
 		if (url.pathname !== "/mcp") {
-			res.writeHead(404);
-			res.end("Not found");
+			res.writeHead(404, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ error: "not_found" }));
 			return;
 		}
 
 		if (req.method !== "POST") {
-			res.writeHead(405);
-			res.end("Method not allowed");
+			res.writeHead(405, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ error: "method_not_allowed" }));
 			return;
 		}
 

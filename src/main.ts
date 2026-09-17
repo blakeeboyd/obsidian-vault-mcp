@@ -17,6 +17,7 @@ import { McpHttpServer } from "./server";
 import { handleMcpRequest } from "./handlers";
 import { TOOL_CATEGORIES } from "./tools";
 import { SemanticIndex, RelatedNote, chunkMarkdown } from "./semantic";
+import { ConsoleBuffer } from "./console-buffer";
 
 const AUTO_PORT_TRIES = 10;
 
@@ -49,6 +50,12 @@ class ExcludedFoldersModal extends Modal {
 		const style = document.createElement("style");
 		style.id = id;
 		style.textContent = `
+			/* Scroll inside the modal so a tall folder tree stays within the
+			   rounded corners instead of overflowing past them. */
+			.vault-mcp-folder-modal .modal-content {
+				max-height: 70vh;
+				overflow-y: auto;
+			}
 			.vault-mcp-folder-list .setting-item {
 				padding: 10px 0;
 			}
@@ -725,11 +732,15 @@ export default class VaultMcpPlugin extends Plugin {
 	settings: VaultMcpSettings = DEFAULT_SETTINGS;
 	server: McpHttpServer | null = null;
 	semanticIndex: SemanticIndex | null = null;
+	// Captures console output for the read_console MCP tool. Installed first
+	// in onload so it sees as much plugin startup output as possible.
+	consoleBuffer: ConsoleBuffer = new ConsoleBuffer();
 	// Updated by reindex runs; reflected in the settings tab.
 	semanticProgress: { done: number; total: number } | null = null;
 	private reindexTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
 	async onload(): Promise<void> {
+		this.consoleBuffer.install();
 		await this.loadSettings();
 		this.addSettingTab(new VaultMcpSettingTab(this.app, this));
 		await this.startServer();
@@ -797,6 +808,7 @@ export default class VaultMcpPlugin extends Plugin {
 	async onunload(): Promise<void> {
 		this.clearAllReindexTimers();
 		await this.stopServer();
+		this.consoleBuffer.uninstall();
 	}
 
 	async startServer(): Promise<void> {
@@ -807,7 +819,13 @@ export default class VaultMcpPlugin extends Plugin {
 		for (let attempt = 0; attempt < maxTries; attempt++) {
 			try {
 				const server = new McpHttpServer(port, (request) =>
-					handleMcpRequest(this.app, this.settings, this.semanticIndex, request)
+					handleMcpRequest(
+						this.app,
+						this.settings,
+						this.semanticIndex,
+						this.consoleBuffer,
+						request
+					)
 				);
 				await server.start();
 				this.server = server;
@@ -957,6 +975,11 @@ export default class VaultMcpPlugin extends Plugin {
 			if (!this.settings.semantic.enabled) return;
 			if (!this.settings.semantic.autoReindex) return;
 			if (!this.semanticIndex) return;
+			// A batch scan is mid-flight; re-arm rather than racing it.
+			if (this.semanticIndex.isIndexing()) {
+				this.scheduleReindex(file);
+				return;
+			}
 			// Re-resolve in case the file was renamed or deleted while pending.
 			const current = this.app.vault.getAbstractFileByPath(path);
 			if (!(current instanceof TFile)) return;
@@ -1133,7 +1156,7 @@ class VaultMcpSettingTab extends PluginSettingTab {
 					.setDesc(label.desc)
 					.addToggle((toggle) =>
 						toggle
-							.setValue(this.plugin.settings.enabledTools[toolName])
+							.setValue(this.plugin.settings.enabledTools[toolName] !== false)
 							.onChange(async (value) => {
 								this.plugin.settings.enabledTools[toolName] = value;
 								await this.plugin.saveSettings();

@@ -2,6 +2,7 @@ import { App } from "obsidian";
 import { JsonRpcRequest, JsonRpcResponse, VaultMcpSettings } from "./types";
 import { getEnabledTools, handleToolCall, ToolContext } from "./tools";
 import { SemanticIndex } from "./semantic";
+import { ConsoleBuffer } from "./console-buffer";
 
 const SERVER_INFO = {
 	name: "obsidian-vault-mcp",
@@ -12,6 +13,7 @@ export async function handleMcpRequest(
 	app: App,
 	settings: VaultMcpSettings,
 	semanticIndex: SemanticIndex | null,
+	consoleBuffer: ConsoleBuffer,
 	request: JsonRpcRequest
 ): Promise<JsonRpcResponse | null> {
 	if (request.id === undefined || request.id === null) {
@@ -74,6 +76,7 @@ export async function handleMcpRequest(
 				excludedPaths: settings.excludedPaths,
 				semanticIndex,
 				semanticEnabled: settings.semantic.enabled,
+				consoleBuffer,
 			};
 			const result = await handleToolCall(ctx, name, args);
 			return {

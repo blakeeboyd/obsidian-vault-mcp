@@ -354,6 +354,14 @@ export class SemanticIndex {
 		};
 	}
 
+	// True while a batch scan (deltaScan/reindexAll) is embedding + persisting.
+	// Callers of the single-file reindex path must not run concurrently with a
+	// batch: both mutate this.entries and both rewrite embeddings.jsonl, which
+	// corrupts the index and can crash Obsidian.
+	isIndexing(): boolean {
+		return this.indexing;
+	}
+
 	private adapter(): DataAdapter {
 		return this.app.vault.adapter;
 	}
