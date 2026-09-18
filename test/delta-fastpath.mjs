@@ -18,11 +18,13 @@
 
 import assert from "node:assert/strict";
 
-function vaultDiffersFromMeta(stored, files) {
+function vaultDiffersFromMeta(stored, files, empty = new Map()) {
 	if (!stored) return true;
-	if (files.length !== Object.keys(stored).length) return true;
+	if (files.length !== Object.keys(stored).length + empty.size) return true;
 	for (const file of files) {
-		if (stored[file.path] !== file.stat.mtime) return true;
+		if (stored[file.path] === file.stat.mtime) continue;
+		if (empty.get(file.path) === file.stat.mtime) continue;
+		return true;
 	}
 	return false;
 }
@@ -96,6 +98,48 @@ assert.equal(
 	vaultDiffersFromMeta({ "a.md": 100 }, [f("b.md", 100)]),
 	true,
 	"path present in vault but absent from meta must differ"
+);
+
+// --- chunkless files -------------------------------------------------------
+// Frontmatter-only stubs produce no chunks, so they hold no vectors and cannot
+// live in the mtime map. Without a separate record they look unindexed on every
+// scan and get re-embedded forever. This was a real bug: 88 concept stubs were
+// re-embedded on every single startup of this vault.
+
+// A stub recorded as empty at its current mtime is known: no difference.
+assert.equal(
+	vaultDiffersFromMeta(
+		{ "a.md": 100 },
+		[f("a.md", 100), f("stub.md", 300)],
+		new Map([["stub.md", 300]])
+	),
+	false,
+	"a chunkless file recorded at its current mtime must count as known"
+);
+
+// The same stub edited (new mtime) must be re-read — it may now have a body.
+assert.equal(
+	vaultDiffersFromMeta(
+		{ "a.md": 100 },
+		[f("a.md", 100), f("stub.md", 301)],
+		new Map([["stub.md", 300]])
+	),
+	true,
+	"an edited chunkless file must be re-read in case it gained content"
+);
+
+// A stub that is gone from disk changes the count and must be detected.
+assert.equal(
+	vaultDiffersFromMeta({ "a.md": 100 }, [f("a.md", 100)], new Map([["stub.md", 300]])),
+	true,
+	"a deleted chunkless file must be detected"
+);
+
+// Empty map plus indexed files still behaves like the base case.
+assert.equal(
+	vaultDiffersFromMeta({ "a.md": 100 }, [f("a.md", 100)], new Map()),
+	false,
+	"empty chunkless map must not affect the unchanged case"
 );
 
 console.log("delta fast path: all checks passed");

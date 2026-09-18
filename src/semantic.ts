@@ -91,6 +91,10 @@ interface IndexMeta {
 	// path -> mtime, mirroring the per-file mtime stored on every chunk.
 	// Present from v2 on; absent when the index was written by an older build.
 	files?: Record<string, number>;
+	// path -> mtime for files that yield no chunks. They own no vectors, so
+	// without this they would look unindexed on every scan and be re-embedded
+	// forever.
+	empty?: Record<string, number>;
 }
 
 function base64FromFloat32(arr: Float32Array): string {
@@ -342,6 +346,11 @@ export class SemanticIndex {
 	// startup delta scan detect "nothing changed" without parsing the index.
 	// Null until readMeta() runs; empty for a pre-v2 meta file.
 	private fileMtimes: Record<string, number> | null = null;
+	// Files that produce no chunks (frontmatter-only stubs, empty notes).
+	// They hold no vectors, so byPath cannot remember them and every delta
+	// scan would otherwise re-embed them forever. Tracked by mtime so a stub
+	// that later gains a body is still picked up.
+	private emptyFiles: Map<string, number> = new Map();
 	// Mean-pooled, L2-renormalized note vectors for find_related_notes.
 	// Computed lazily and busted whenever the underlying chunks change.
 	private noteVectorCache: Map<string, Float32Array> = new Map();
@@ -385,6 +394,7 @@ export class SemanticIndex {
 			const meta: IndexMeta = JSON.parse(await adapter.read(this.metaPath));
 			this.lastIndexedAt = meta.updated || null;
 			this.fileMtimes = meta.files ?? null;
+			if (meta.empty) this.emptyFiles = new Map(Object.entries(meta.empty));
 			return meta;
 		} catch (err) {
 			console.warn("vault-mcp: could not read index meta", err);
@@ -455,10 +465,9 @@ export class SemanticIndex {
 					`vault-mcp: skipped ${skipped} corrupt line(s) while loading semantic index`
 				);
 			}
-			if (await adapter.exists(this.metaPath)) {
-				const meta: IndexMeta = JSON.parse(await adapter.read(this.metaPath));
-				this.lastIndexedAt = meta.updated || null;
-			}
+			// Shared with the startup fast path, so both routes pick up
+			// lastIndexedAt, the mtime map, and the chunkless-file map.
+			await this.readMeta();
 			// Dedupe by (path, chunk) tuple. If the on-disk index was written
 			// by a buggy session (e.g. before the load-race fix), the same
 			// chunk can appear N times. Collapse to the first occurrence per
@@ -534,6 +543,7 @@ export class SemanticIndex {
 			dim: EMBEDDING_DIM,
 			updated: Date.now(),
 			files,
+			empty: Object.fromEntries(this.emptyFiles),
 		};
 		await adapter.write(this.metaPath, JSON.stringify(meta, null, 2));
 		this.lastIndexedAt = meta.updated;
@@ -583,13 +593,16 @@ export class SemanticIndex {
 		await this.ensureReady();
 		const existing = this.byPath.get(file.path);
 		if (existing && existing[0]?.mtime === file.stat.mtime) return;
+		if (this.emptyFiles.get(file.path) === file.stat.mtime) return;
 
 		const content = await this.app.vault.cachedRead(file);
 		const chunks = chunkMarkdown(file.path, content);
 		if (chunks.length === 0) {
 			this.removePath(file.path);
+			this.emptyFiles.set(file.path, file.stat.mtime);
 			return;
 		}
+		this.emptyFiles.delete(file.path);
 
 		const vectors = await this.embedder.embed(chunks);
 		this.removePath(file.path);
@@ -629,9 +642,15 @@ export class SemanticIndex {
 	private vaultDiffersFromMeta(files: TFile[]): boolean {
 		const stored = this.fileMtimes;
 		if (!stored) return true;
-		if (files.length !== Object.keys(stored).length) return true;
+		// A file is "known" if it is indexed OR recorded as chunkless at this
+		// same mtime. Counting both is what catches a removal.
+		if (files.length !== Object.keys(stored).length + this.emptyFiles.size) {
+			return true;
+		}
 		for (const file of files) {
-			if (stored[file.path] !== file.stat.mtime) return true;
+			if (stored[file.path] === file.stat.mtime) continue;
+			if (this.emptyFiles.get(file.path) === file.stat.mtime) continue;
+			return true;
 		}
 		return false;
 	}
@@ -672,6 +691,15 @@ export class SemanticIndex {
 		for (const path of this.byPath.keys()) {
 			if (!currentPaths.has(path)) toRemove.push(path);
 		}
+		// Drop chunkless files that no longer exist, so the map cannot grow
+		// without bound as stubs are deleted or renamed.
+		let emptyPruned = 0;
+		for (const path of [...this.emptyFiles.keys()]) {
+			if (!currentPaths.has(path)) {
+				this.emptyFiles.delete(path);
+				emptyPruned++;
+			}
+		}
 
 		const toEmbed: TFile[] = [];
 		let added = 0;
@@ -679,6 +707,9 @@ export class SemanticIndex {
 		for (const file of files) {
 			const existing = this.byPath.get(file.path);
 			if (!existing) {
+				// Already known to produce no chunks at this mtime: re-reading
+				// it would yield nothing again.
+				if (this.emptyFiles.get(file.path) === file.stat.mtime) continue;
 				toEmbed.push(file);
 				added++;
 			} else if (existing[0]?.mtime !== file.stat.mtime) {
@@ -688,6 +719,8 @@ export class SemanticIndex {
 		}
 
 		if (toRemove.length === 0 && toEmbed.length === 0) {
+			// Pruned stubs still need writing back, or they reappear next scan.
+			if (emptyPruned > 0) await this.persist();
 			return { added: 0, updated: 0, removed: 0 };
 		}
 
