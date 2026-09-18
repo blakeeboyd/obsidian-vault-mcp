@@ -1,15 +1,26 @@
+// Ring buffer that captures console output so the MCP server can read it.
+//
+// Obsidian plugins run in Electron's renderer process; console.log/warn/error
+// land in the DevTools console, which an MCP client cannot see. This module
+// patches the four console methods at install time, mirrors every call into a
+// fixed-size buffer, then forwards to the originals so DevTools still works.
+// It also subscribes to uncaught errors and unhandled promise rejections,
+// since those are the entries most worth surfacing when debugging.
+//
+// Capture begins at install() and ends at uninstall(); anything logged before
+// the plugin loaded is not recoverable. The buffer is capacity-bounded, so old
+// entries fall off once it fills.
+
 export type ConsoleLevel = "log" | "info" | "warn" | "error" | "debug";
 
 export interface ConsoleEntry {
+	// Wall-clock time the entry was captured (ms since epoch).
 	timestamp: number;
 	level: ConsoleLevel;
+	// The console arguments rendered to a single string, the way DevTools
+	// would show them. Objects are JSON-stringified; circular refs degrade
+	// to String(arg) rather than throwing.
 	message: string;
-}
-
-export interface ConsoleReadOptions {
-	levels?: ConsoleLevel[];
-	filter?: string;
-	limit?: number;
 }
 
 const PATCHED_METHODS: ConsoleLevel[] = ["log", "info", "warn", "error", "debug"];
@@ -25,8 +36,7 @@ function renderArg(arg: unknown): string {
 		try {
 			return JSON.stringify(arg);
 		} catch {
-			// Circular or otherwise unserializable — String() is better than losing
-			// the entry entirely.
+			// Circular or otherwise non-serializable.
 			return String(arg);
 		}
 	}
@@ -37,8 +47,6 @@ function renderArgs(args: unknown[]): string {
 	return args.map(renderArg).join(" ");
 }
 
-// Ring buffer over console output, exposed through the read_console tool so a
-// plugin bug can be diagnosed over MCP without opening DevTools.
 export class ConsoleBuffer {
 	private entries: ConsoleEntry[] = [];
 	private installed = false;
@@ -46,10 +54,11 @@ export class ConsoleBuffer {
 	// Saved originals so we can restore on uninstall and forward to DevTools
 	// while patched. Keyed by level.
 	private originals: Partial<Record<ConsoleLevel, (...args: unknown[]) => void>> = {};
+
 	private errorHandler: ((event: ErrorEvent) => void) | null = null;
 	private rejectionHandler: ((event: PromiseRejectionEvent) => void) | null = null;
 
-	constructor(private capacity = 500) {}
+	constructor(private capacity: number = 500) {}
 
 	install(): void {
 		if (this.installed) return;
@@ -65,10 +74,9 @@ export class ConsoleBuffer {
 		}
 
 		this.errorHandler = (event: ErrorEvent) => {
-			const detail =
-				event.error instanceof Error
-					? event.error.stack || event.error.message
-					: event.message;
+			const detail = event.error instanceof Error
+				? event.error.stack || event.error.message
+				: event.message;
 			this.push("error", `Uncaught: ${detail}`);
 		};
 		this.rejectionHandler = (event: PromiseRejectionEvent) => {
@@ -98,9 +106,11 @@ export class ConsoleBuffer {
 		}
 	}
 
-	push(level: ConsoleLevel, message: string): void {
+	private push(level: ConsoleLevel, message: string): void {
 		this.entries.push({ timestamp: Date.now(), level, message });
 		if (this.entries.length > this.capacity) {
+			// Drop the oldest. Splice in a batch to avoid shift() churn if the
+			// buffer somehow overshoots (e.g. capacity lowered at runtime).
 			this.entries.splice(0, this.entries.length - this.capacity);
 		}
 	}
@@ -110,9 +120,12 @@ export class ConsoleBuffer {
 	}
 
 	// Return buffered entries, newest last, after applying optional filters.
-	read(opts: ConsoleReadOptions = {}): ConsoleEntry[] {
+	read(opts: {
+		levels?: ConsoleLevel[];
+		filter?: string;
+		limit?: number;
+	} = {}): ConsoleEntry[] {
 		let result = this.entries;
-
 		if (opts.levels && opts.levels.length > 0) {
 			const set = new Set(opts.levels);
 			result = result.filter((e) => set.has(e.level));
@@ -122,6 +135,7 @@ export class ConsoleBuffer {
 			result = result.filter((e) => e.message.toLowerCase().includes(needle));
 		}
 		if (opts.limit !== undefined && opts.limit >= 0 && result.length > opts.limit) {
+			// Keep the most recent `limit` entries.
 			result = result.slice(result.length - opts.limit);
 		}
 		return result;
