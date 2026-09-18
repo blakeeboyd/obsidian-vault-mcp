@@ -9,7 +9,10 @@ import { buildEmbedderIframeScript } from "./embedder-iframe";
 
 const MODEL_ID = "TaylorAI/bge-micro-v2";
 const EMBEDDING_DIM = 384;
-const INDEX_VERSION = 1;
+// v2 adds the `files` mtime map, which lets a startup delta scan decide
+// whether anything changed without parsing the (often 100MB+) index. A v1
+// meta file still loads; the map is rebuilt on the next persist.
+const INDEX_VERSION = 2;
 
 // Chunking parameters — tuned for typical markdown notes.
 const MAX_CHUNK_CHARS = 1500;
@@ -85,6 +88,13 @@ interface IndexMeta {
 	model: string;
 	dim: number;
 	updated: number;
+	// path -> mtime, mirroring the per-file mtime stored on every chunk.
+	// Present from v2 on; absent when the index was written by an older build.
+	files?: Record<string, number>;
+	// path -> mtime for files that yield no chunks. They own no vectors, so
+	// without this they would look unindexed on every scan and be re-embedded
+	// forever.
+	empty?: Record<string, number>;
 }
 
 function base64FromFloat32(arr: Float32Array): string {
@@ -332,6 +342,15 @@ export class SemanticIndex {
 	private indexLoaded = false;
 	private loadingPromise: Promise<void> | null = null;
 	private lastIndexedAt: number | null = null;
+	// path -> mtime as last persisted, read from the meta sidecar. Lets a
+	// startup delta scan detect "nothing changed" without parsing the index.
+	// Null until readMeta() runs; empty for a pre-v2 meta file.
+	private fileMtimes: Record<string, number> | null = null;
+	// Files that produce no chunks (frontmatter-only stubs, empty notes).
+	// They hold no vectors, so byPath cannot remember them and every delta
+	// scan would otherwise re-embed them forever. Tracked by mtime so a stub
+	// that later gains a body is still picked up.
+	private emptyFiles: Map<string, number> = new Map();
 	// Mean-pooled, L2-renormalized note vectors for find_related_notes.
 	// Computed lazily and busted whenever the underlying chunks change.
 	private noteVectorCache: Map<string, Float32Array> = new Map();
@@ -354,8 +373,33 @@ export class SemanticIndex {
 		};
 	}
 
+	// True while a batch scan (deltaScan/reindexAll) is embedding + persisting.
+	// Callers of the single-file reindex path must not run concurrently with a
+	// batch: both mutate this.entries and both rewrite embeddings.jsonl, which
+	// corrupts the index and can crash Obsidian.
+	isIndexing(): boolean {
+		return this.indexing;
+	}
+
 	private adapter(): DataAdapter {
 		return this.app.vault.adapter;
+	}
+
+	// Read the meta sidecar only (a few hundred KB at most), without touching
+	// the index itself. Safe to call before load().
+	private async readMeta(): Promise<IndexMeta | null> {
+		const adapter = this.adapter();
+		if (!(await adapter.exists(this.metaPath))) return null;
+		try {
+			const meta: IndexMeta = JSON.parse(await adapter.read(this.metaPath));
+			this.lastIndexedAt = meta.updated || null;
+			this.fileMtimes = meta.files ?? null;
+			if (meta.empty) this.emptyFiles = new Map(Object.entries(meta.empty));
+			return meta;
+		} catch (err) {
+			console.warn("vault-mcp: could not read index meta", err);
+			return null;
+		}
 	}
 
 	async load(): Promise<void> {
@@ -421,10 +465,9 @@ export class SemanticIndex {
 					`vault-mcp: skipped ${skipped} corrupt line(s) while loading semantic index`
 				);
 			}
-			if (await adapter.exists(this.metaPath)) {
-				const meta: IndexMeta = JSON.parse(await adapter.read(this.metaPath));
-				this.lastIndexedAt = meta.updated || null;
-			}
+			// Shared with the startup fast path, so both routes pick up
+			// lastIndexedAt, the mtime map, and the chunkless-file map.
+			await this.readMeta();
 			// Dedupe by (path, chunk) tuple. If the on-disk index was written
 			// by a buggy session (e.g. before the load-race fix), the same
 			// chunk can appear N times. Collapse to the first occurrence per
@@ -490,14 +533,21 @@ export class SemanticIndex {
 			return JSON.stringify(stored);
 		});
 		await adapter.write(this.indexPath, lines.join("\n"));
+		const files: Record<string, number> = {};
+		for (const [path, list] of this.byPath.entries()) {
+			if (list[0]) files[path] = list[0].mtime;
+		}
 		const meta: IndexMeta = {
 			version: INDEX_VERSION,
 			model: MODEL_ID,
 			dim: EMBEDDING_DIM,
 			updated: Date.now(),
+			files,
+			empty: Object.fromEntries(this.emptyFiles),
 		};
 		await adapter.write(this.metaPath, JSON.stringify(meta, null, 2));
 		this.lastIndexedAt = meta.updated;
+		this.fileMtimes = files;
 	}
 
 	private removePath(path: string): void {
@@ -543,13 +593,16 @@ export class SemanticIndex {
 		await this.ensureReady();
 		const existing = this.byPath.get(file.path);
 		if (existing && existing[0]?.mtime === file.stat.mtime) return;
+		if (this.emptyFiles.get(file.path) === file.stat.mtime) return;
 
 		const content = await this.app.vault.cachedRead(file);
 		const chunks = chunkMarkdown(file.path, content);
 		if (chunks.length === 0) {
 			this.removePath(file.path);
+			this.emptyFiles.set(file.path, file.stat.mtime);
 			return;
 		}
+		this.emptyFiles.delete(file.path);
 
 		const vectors = await this.embedder.embed(chunks);
 		this.removePath(file.path);
@@ -583,6 +636,25 @@ export class SemanticIndex {
 		if (this.indexLoaded) await this.persist();
 	}
 
+	// True if the vault no longer matches the persisted mtime map: a file was
+	// added, modified, or removed. Counting first catches removals without
+	// building a second Set — the maps must agree on size and on every entry.
+	private vaultDiffersFromMeta(files: TFile[]): boolean {
+		const stored = this.fileMtimes;
+		if (!stored) return true;
+		// A file is "known" if it is indexed OR recorded as chunkless at this
+		// same mtime. Counting both is what catches a removal.
+		if (files.length !== Object.keys(stored).length + this.emptyFiles.size) {
+			return true;
+		}
+		for (const file of files) {
+			if (stored[file.path] === file.stat.mtime) continue;
+			if (this.emptyFiles.get(file.path) === file.stat.mtime) continue;
+			return true;
+		}
+		return false;
+	}
+
 	// Reconcile stored index with current vault state without re-embedding
 	// unchanged files. Catches external edits (e.g. Synology sync) that bypass
 	// Obsidian's file events, which only fire while the app is running.
@@ -590,7 +662,6 @@ export class SemanticIndex {
 		excludedPaths: string[],
 		onProgress?: (done: number, total: number) => void
 	): Promise<{ added: number; updated: number; removed: number }> {
-		await this.load();
 		if (this.indexing) return { added: 0, updated: 0, removed: 0 };
 
 		const files = this.app.vault
@@ -598,11 +669,36 @@ export class SemanticIndex {
 			.filter((f) => !excludedPaths.some(
 				(ex) => f.path === ex || f.path.startsWith(ex + "/")
 			));
+
+		// Fast path: compare the vault against the mtime map in the meta
+		// sidecar. On an unchanged vault this answers "nothing to do" without
+		// reading the index at all, which on a large vault is the difference
+		// between a multi-second startup parse and a few milliseconds.
+		if (!this.indexLoaded) {
+			await this.readMeta();
+			if (this.fileMtimes && !this.vaultDiffersFromMeta(files)) {
+				return { added: 0, updated: 0, removed: 0 };
+			}
+		}
+
+		// Something changed (or the meta predates the mtime map): the real work
+		// needs the vectors in memory.
+		await this.load();
+
 		const currentPaths = new Set(files.map((f) => f.path));
 
 		const toRemove: string[] = [];
 		for (const path of this.byPath.keys()) {
 			if (!currentPaths.has(path)) toRemove.push(path);
+		}
+		// Drop chunkless files that no longer exist, so the map cannot grow
+		// without bound as stubs are deleted or renamed.
+		let emptyPruned = 0;
+		for (const path of [...this.emptyFiles.keys()]) {
+			if (!currentPaths.has(path)) {
+				this.emptyFiles.delete(path);
+				emptyPruned++;
+			}
 		}
 
 		const toEmbed: TFile[] = [];
@@ -611,6 +707,9 @@ export class SemanticIndex {
 		for (const file of files) {
 			const existing = this.byPath.get(file.path);
 			if (!existing) {
+				// Already known to produce no chunks at this mtime: re-reading
+				// it would yield nothing again.
+				if (this.emptyFiles.get(file.path) === file.stat.mtime) continue;
 				toEmbed.push(file);
 				added++;
 			} else if (existing[0]?.mtime !== file.stat.mtime) {
@@ -620,6 +719,8 @@ export class SemanticIndex {
 		}
 
 		if (toRemove.length === 0 && toEmbed.length === 0) {
+			// Pruned stubs still need writing back, or they reappear next scan.
+			if (emptyPruned > 0) await this.persist();
 			return { added: 0, updated: 0, removed: 0 };
 		}
 

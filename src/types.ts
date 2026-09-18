@@ -34,6 +34,7 @@ export interface ToolToggles {
 	list_files: boolean;
 	read_file: boolean;
 	write_file: boolean;
+	append_to_file: boolean;
 	find_backlinks: boolean;
 	search_vault: boolean;
 	query_frontmatter: boolean;
@@ -48,6 +49,12 @@ export interface ToolToggles {
 	list_templates: boolean;
 	create_from_template: boolean;
 	get_vault_info: boolean;
+	read_console: boolean;
+	clear_console: boolean;
+	list_plugins: boolean;
+	set_plugin_enabled: boolean;
+	list_commands: boolean;
+	run_command: boolean;
 }
 
 export interface SemanticSettings {
@@ -79,6 +86,7 @@ export const DEFAULT_SETTINGS: VaultMcpSettings = {
 		list_files: true,
 		read_file: true,
 		write_file: true,
+		append_to_file: true,
 		find_backlinks: true,
 		search_vault: true,
 		query_frontmatter: true,
@@ -93,6 +101,12 @@ export const DEFAULT_SETTINGS: VaultMcpSettings = {
 		list_templates: true,
 		create_from_template: true,
 		get_vault_info: true,
+		read_console: true,
+		clear_console: true,
+		list_plugins: true,
+		set_plugin_enabled: true,
+		list_commands: true,
+		run_command: true,
 	},
 	excludedPaths: [],
 	semantic: {

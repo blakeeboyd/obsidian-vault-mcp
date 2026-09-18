@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"test": "node test/delta-fastpath.mjs",
 		"install-plugin": "node scripts/install.mjs",
 		"deploy": "npm run build && npm run install-plugin"
 	},

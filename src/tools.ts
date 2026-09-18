@@ -1,12 +1,23 @@
 import { App, TFile, TFolder, getAllTags, prepareSimpleSearch } from "obsidian";
 import { ToolDefinition, ToolResult, ToolToggles } from "./types";
 import { SemanticIndex } from "./semantic";
+import { ConsoleBuffer, ConsoleLevel } from "./console-buffer";
+import {
+	getInternalCommands,
+	getInternalPlugins,
+	isDestructiveCommand,
+	listCommands,
+	listPlugins,
+} from "./obsidian-internals";
+
+const SELF_PLUGIN_ID = "obsidian-vault-mcp";
 
 export interface ToolContext {
 	app: App;
 	excludedPaths: string[];
 	semanticIndex: SemanticIndex | null;
 	semanticEnabled: boolean;
+	consoleBuffer: ConsoleBuffer;
 }
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
@@ -105,6 +116,26 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 				},
 			},
 			required: ["path", "content"],
+		},
+	},
+	{
+		name: "append_to_file",
+		description:
+			"Append text to a file using vault.process (transactional read-modify-write). Unlike write_file (a raw overwrite), this routes through the same edit path that Relay's shared-folder sync observes, so appends to a synced file propagate to other vaults. Use for chat/collab files under a Relay shared folder. Creates the file if it does not exist.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				path: {
+					type: "string",
+					description: "File path relative to vault root",
+				},
+				text: {
+					type: "string",
+					description:
+						"Text to append. A trailing newline is added if the file does not already end with one.",
+				},
+			},
+			required: ["path", "text"],
 		},
 	},
 	{
@@ -402,6 +433,118 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 			properties: {},
 		},
 	},
+	{
+		name: "read_console",
+		description:
+			"Read recent entries from the Obsidian developer console. The plugin captures all console.log/info/warn/error/debug output (from this plugin, other plugins, and Obsidian core) plus uncaught exceptions and unhandled promise rejections, starting from when the plugin loaded. Useful for debugging plugin errors without opening DevTools. Returns entries oldest-first with timestamps and levels.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				levels: {
+					type: "array",
+					items: {
+						type: "string",
+						enum: ["log", "info", "warn", "error", "debug"],
+					},
+					description:
+						"Optional list of levels to include (e.g. ['error', 'warn']). Omit to include all levels.",
+				},
+				filter: {
+					type: "string",
+					description:
+						"Optional case-insensitive substring; only entries whose message contains it are returned.",
+				},
+				limit: {
+					type: "number",
+					description:
+						"Maximum number of most-recent entries to return (default: 100).",
+				},
+			},
+		},
+	},
+	{
+		name: "clear_console",
+		description:
+			"Clear the plugin's captured console buffer. Use before reproducing a bug so a subsequent read_console returns only the new output. Does not affect the actual DevTools console.",
+		inputSchema: {
+			type: "object",
+			properties: {},
+		},
+	},
+	{
+		name: "list_plugins",
+		description:
+			"List installed community plugins with their id, display name, version, and whether they are currently enabled. Use the id with set_plugin_enabled.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				enabled_only: {
+					type: "boolean",
+					description:
+						"If true, return only currently-enabled plugins (default: false).",
+				},
+			},
+		},
+	},
+	{
+		name: "set_plugin_enabled",
+		description:
+			"Enable or disable a community plugin by id, persisting the change to Obsidian config (survives restart). Combine with read_console to disable then re-enable a plugin and capture its startup output. Cannot toggle this plugin (obsidian-vault-mcp) itself.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: {
+					type: "string",
+					description: "Plugin id (from list_plugins, e.g. 'dataview').",
+				},
+				enabled: {
+					type: "boolean",
+					description: "true to enable, false to disable.",
+				},
+				delay_ms: {
+					type: "number",
+					description:
+						"Wait this many milliseconds after the toggle before returning, so a plugin's async load (and any console output it emits during load) finishes before a follow-up read_console. Capped at 10000. Default 0.",
+				},
+			},
+			required: ["id", "enabled"],
+		},
+	},
+	{
+		name: "list_commands",
+		description:
+			"List all commands registered in Obsidian's command palette (Cmd+P), returning each command's id and display name. Use the id with run_command.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				filter: {
+					type: "string",
+					description:
+						"Optional case-insensitive substring to match against command id or name.",
+				},
+			},
+		},
+	},
+	{
+		name: "run_command",
+		description:
+			"Execute an Obsidian command by id, as if invoked from the command palette (Cmd+P). Commands whose id or name suggests a destructive effect (delete, trash, clear, reset, etc.) are refused unless confirm:true is passed. Some commands require an active editor or specific context and may silently no-op.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: {
+					type: "string",
+					description: "Command id (from list_commands, e.g. 'editor:toggle-bold').",
+				},
+				confirm: {
+					type: "boolean",
+					description:
+						"Required (true) to run a command flagged as potentially destructive. Ignored for other commands.",
+				},
+			},
+			required: ["id"],
+		},
+	},
 ];
 
 export interface ToolLabel {
@@ -490,6 +633,10 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
 				name: "Patch Content",
 				desc: "Insert or replace content at a specific location",
 			},
+			append_to_file: {
+				name: "Append to File",
+				desc: "Append text transactionally, so Relay-synced files propagate",
+			},
 			open_file: {
 				name: "Open File",
 				desc: "Open a file in the Obsidian editor",
@@ -511,6 +658,44 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
 			create_from_template: {
 				name: "Create from Template",
 				desc: "Create a file using a Templater template",
+			},
+		},
+	},
+	{
+		heading: "Diagnostics",
+		description:
+			"Surface the Obsidian developer console to the MCP client. The plugin buffers console output from the moment it loads; these tools read and clear that buffer.",
+		tools: {
+			read_console: {
+				name: "Read Console",
+				desc: "Read recent captured console output (logs, warnings, errors)",
+			},
+			clear_console: {
+				name: "Clear Console Buffer",
+				desc: "Empty the captured console buffer",
+			},
+		},
+	},
+	{
+		heading: "App Control",
+		description:
+			"Let the MCP client manage plugins and run command-palette commands. Useful for a disable → re-enable → read_console debugging loop. Destructive-looking commands require an explicit confirm flag.",
+		tools: {
+			list_plugins: {
+				name: "List Plugins",
+				desc: "List installed plugins and their enabled state",
+			},
+			set_plugin_enabled: {
+				name: "Enable / Disable Plugin",
+				desc: "Toggle a community plugin on or off (persisted)",
+			},
+			list_commands: {
+				name: "List Commands",
+				desc: "List command-palette commands and their ids",
+			},
+			run_command: {
+				name: "Run Command",
+				desc: "Execute a command-palette command by id",
 			},
 		},
 	},
@@ -672,6 +857,36 @@ async function handleWriteFile(
 
 	await app.vault.create(path, content);
 	return textResult(`Created file: ${path}`);
+}
+
+async function handleAppendToFile(
+	app: App,
+	args: Record<string, unknown>
+): Promise<ToolResult> {
+	const path = normalizePath(String(args.path || ""));
+	const text = String(args.text ?? "");
+	if (!path) return errorResult("Invalid path");
+
+	await ensureParentFolder(app, path);
+
+	const existing = app.vault.getAbstractFileByPath(path);
+	if (existing && !(existing instanceof TFile)) {
+		return errorResult(`A folder exists at: ${path}`);
+	}
+	if (!existing) {
+		await app.vault.create(path, "");
+	}
+
+	const file = app.vault.getAbstractFileByPath(path) as TFile;
+	// vault.process is the transactional read-modify-write path; Relay observes
+	// it, so appends to a shared-folder file propagate to other vaults.
+	await app.vault.process(file, (data) => {
+		const sep = data.length === 0 || data.endsWith("\n") ? "" : "\n";
+		const tail = text.endsWith("\n") ? "" : "\n";
+		return data + sep + text + tail;
+	});
+
+	return textResult(`Appended to file: ${path}`);
 }
 
 async function handleFindBacklinks(
@@ -1288,6 +1503,180 @@ async function handleGetVaultInfo(app: App): Promise<ToolResult> {
 	);
 }
 
+const VALID_CONSOLE_LEVELS: ConsoleLevel[] = ["log", "info", "warn", "error", "debug"];
+
+async function handleReadConsole(
+	ctx: ToolContext,
+	args: Record<string, unknown>
+): Promise<ToolResult> {
+	let levels: ConsoleLevel[] | undefined;
+	if (Array.isArray(args.levels)) {
+		levels = args.levels
+			.map((l) => String(l) as ConsoleLevel)
+			.filter((l) => VALID_CONSOLE_LEVELS.includes(l));
+	}
+	const filter = args.filter ? String(args.filter) : undefined;
+	const limit = typeof args.limit === "number" ? args.limit : 100;
+
+	const entries = ctx.consoleBuffer.read({ levels, filter, limit });
+	if (entries.length === 0) {
+		const total = ctx.consoleBuffer.size();
+		return textResult(
+			total === 0
+				? "Console buffer is empty. (Output is captured from when the plugin loaded onward.)"
+				: "No console entries match the given filters."
+		);
+	}
+
+	const lines = entries.map((e) => {
+		const time = new Date(e.timestamp).toISOString().slice(11, 23);
+		return `[${time}] ${e.level.toUpperCase()}: ${e.message}`;
+	});
+	const header = `Showing ${entries.length} of ${ctx.consoleBuffer.size()} buffered entries:`;
+	return textResult(`${header}\n${lines.join("\n")}`);
+}
+
+async function handleClearConsole(ctx: ToolContext): Promise<ToolResult> {
+	const cleared = ctx.consoleBuffer.size();
+	ctx.consoleBuffer.clear();
+	return textResult(`Cleared ${cleared} console entr${cleared === 1 ? "y" : "ies"}.`);
+}
+
+async function handleListPlugins(
+	app: App,
+	args: Record<string, unknown>
+): Promise<ToolResult> {
+	if (!getInternalPlugins(app)) {
+		return errorResult("Plugin manager API is unavailable in this Obsidian version.");
+	}
+
+	const enabledOnly = Boolean(args.enabled_only);
+	let plugins = listPlugins(app);
+	if (enabledOnly) plugins = plugins.filter((p) => p.enabled);
+
+	if (plugins.length === 0) {
+		return textResult(enabledOnly ? "No enabled plugins." : "No plugins found.");
+	}
+
+	const lines = plugins.map((p) => {
+		const state = p.enabled ? "on " : "off";
+		const ver = p.version ? ` v${p.version}` : "";
+		return `[${state}] ${p.id}  —  ${p.name}${ver}`;
+	});
+	return textResult(lines.join("\n"));
+}
+
+async function handleSetPluginEnabled(
+	app: App,
+	args: Record<string, unknown>
+): Promise<ToolResult> {
+	const plugins = getInternalPlugins(app);
+	if (!plugins) {
+		return errorResult("Plugin manager API is unavailable in this Obsidian version.");
+	}
+
+	const id = String(args.id || "").trim();
+	if (!id) return errorResult("id is required");
+	if (typeof args.enabled !== "boolean") {
+		return errorResult("enabled (boolean) is required");
+	}
+	const enabled = args.enabled;
+
+	if (id === SELF_PLUGIN_ID) {
+		return errorResult(
+			"Refusing to toggle obsidian-vault-mcp itself — disabling it would kill the MCP server mid-call. Toggle it from Obsidian settings if needed."
+		);
+	}
+	if (!plugins.manifests[id]) {
+		return errorResult(`No plugin with id '${id}'. Use list_plugins to see available ids.`);
+	}
+
+	const already = plugins.enabledPlugins.has(id);
+	if (already === enabled) {
+		return textResult(`Plugin '${id}' is already ${enabled ? "enabled" : "disabled"}.`);
+	}
+
+	try {
+		if (enabled) {
+			await plugins.enablePluginAndSave(id);
+		} else {
+			await plugins.disablePluginAndSave(id);
+		}
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return errorResult(`Failed to ${enabled ? "enable" : "disable"} '${id}': ${msg}`);
+	}
+
+	// A plugin's onload is async and often logs during startup; waiting here lets
+	// a follow-up read_console see that output instead of racing it.
+	const rawDelay = typeof args.delay_ms === "number" ? args.delay_ms : 0;
+	const delay = Math.min(Math.max(rawDelay, 0), 10000);
+	if (delay > 0) {
+		await new Promise((resolve) => setTimeout(resolve, delay));
+	}
+
+	const waited = delay > 0 ? ` (waited ${delay}ms)` : "";
+	return textResult(`Plugin '${id}' ${enabled ? "enabled" : "disabled"} (saved).${waited}`);
+}
+
+async function handleListCommands(
+	app: App,
+	args: Record<string, unknown>
+): Promise<ToolResult> {
+	if (!getInternalCommands(app)) {
+		return errorResult("Command API is unavailable in this Obsidian version.");
+	}
+
+	let commands = listCommands(app);
+	const filter = args.filter ? String(args.filter).toLowerCase() : "";
+	if (filter) {
+		commands = commands.filter(
+			(c) => c.id.toLowerCase().includes(filter) || c.name.toLowerCase().includes(filter)
+		);
+	}
+
+	if (commands.length === 0) {
+		return textResult(filter ? `No commands match '${filter}'.` : "No commands found.");
+	}
+
+	const lines = commands.map((c) => `${c.id}  —  ${c.name}`);
+	return textResult(
+		`${commands.length} command${commands.length === 1 ? "" : "s"}:\n${lines.join("\n")}`
+	);
+}
+
+async function handleRunCommand(
+	app: App,
+	args: Record<string, unknown>
+): Promise<ToolResult> {
+	const commands = getInternalCommands(app);
+	if (!commands) {
+		return errorResult("Command API is unavailable in this Obsidian version.");
+	}
+
+	const id = String(args.id || "").trim();
+	if (!id) return errorResult("id is required");
+
+	const cmd = commands.commands[id];
+	if (!cmd) {
+		return errorResult(`No command with id '${id}'. Use list_commands to see available ids.`);
+	}
+
+	if (isDestructiveCommand(cmd) && !Boolean(args.confirm)) {
+		return errorResult(
+			`Command '${id}' (${cmd.name}) looks potentially destructive. Re-run with confirm:true to execute it.`
+		);
+	}
+
+	const ran = commands.executeCommandById(id);
+	if (!ran) {
+		return textResult(
+			`Command '${id}' (${cmd.name}) did not run — it likely requires a specific context (active editor, selection, or view) that isn't present.`
+		);
+	}
+	return textResult(`Ran command '${id}' (${cmd.name}).`);
+}
+
 export async function handleToolCall(
 	ctx: ToolContext,
 	name: string,
@@ -1330,6 +1719,11 @@ export async function handleToolCall(
 				const denied = checkAccess(normalizePath(String(args.path || "")));
 				if (denied) return denied;
 				return await handleWriteFile(app, args);
+			}
+			case "append_to_file": {
+				const denied = checkAccess(normalizePath(String(args.path || "")));
+				if (denied) return denied;
+				return await handleAppendToFile(app, args);
 			}
 			case "find_backlinks": {
 				const denied = checkAccess(normalizePath(String(args.path || "")));
@@ -1382,6 +1776,18 @@ export async function handleToolCall(
 			}
 			case "get_vault_info":
 				return await handleGetVaultInfo(app);
+			case "read_console":
+				return await handleReadConsole(ctx, args);
+			case "clear_console":
+				return await handleClearConsole(ctx);
+			case "list_plugins":
+				return await handleListPlugins(app, args);
+			case "set_plugin_enabled":
+				return await handleSetPluginEnabled(app, args);
+			case "list_commands":
+				return await handleListCommands(app, args);
+			case "run_command":
+				return await handleRunCommand(app, args);
 			default:
 				return errorResult(`Unknown tool: ${name}`);
 		}
