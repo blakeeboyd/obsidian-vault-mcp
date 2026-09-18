@@ -934,19 +934,16 @@ export default class VaultMcpPlugin extends Plugin {
 		const indexPath = normalizePath(`${dir}/embeddings.jsonl`);
 		const metaPath = normalizePath(`${dir}/embeddings-meta.json`);
 		this.semanticIndex = new SemanticIndex(this.app, indexPath, metaPath);
-		// Defer the load until Obsidian's layout is ready. Parsing a 100MB+
-		// embeddings.jsonl involves tens of thousands of JSON.parse +
-		// base64-decode calls, and running those during plugin onload competes
-		// with Obsidian's own startup work. Once layout is ready, kick off the
-		// load and reconcile against current vault state. Model downloads
-		// lazily — only triggered if the delta scan finds work to do.
+		// Reconcile against the vault once layout is ready, but do NOT load the
+		// index first. deltaScan compares the vault against the mtime map in
+		// the meta sidecar and only parses embeddings.jsonl when something
+		// actually changed; on an unchanged vault startup costs nothing. The
+		// index still loads on demand from search/find_related/reindex. Model
+		// downloads lazily — only if there is work to do.
 		this.app.workspace.onLayoutReady(() => {
-			this.semanticIndex
-				?.load()
-				.then(() => this.runDeltaScan())
-				.catch((err) =>
-					console.error("vault-mcp: failed to load semantic index:", err)
-				);
+			this.runDeltaScan().catch((err) =>
+				console.error("vault-mcp: delta scan failed:", err)
+			);
 		});
 		return this.semanticIndex;
 	}
@@ -957,12 +954,18 @@ export default class VaultMcpPlugin extends Plugin {
 		await new Promise<void>((resolve) =>
 			this.app.workspace.onLayoutReady(() => resolve())
 		);
-		const notice = new Notice("Vault MCP: checking for changes…", 0);
+		// Created on first progress callback rather than up front: an unchanged
+		// vault now finishes without loading the index, so showing a banner
+		// would advertise work that never happens.
+		// Typed explicitly: control-flow analysis cannot see the assignment
+		// inside the progress callback and would narrow this to `never`.
+		let notice = null as Notice | null;
 		try {
 			const result = await this.semanticIndex.deltaScan(
 				this.settings.excludedPaths,
 				(done, total) => {
 					this.semanticProgress = { done, total };
+					if (!notice) notice = new Notice("Vault MCP: checking for changes…", 0);
 					notice.setMessage(formatProgress("Delta scan", done, total));
 				}
 			);
@@ -970,16 +973,22 @@ export default class VaultMcpPlugin extends Plugin {
 			if (added + updated + removed > 0) {
 				const summary = `Vault MCP: delta scan — ${added} added, ${updated} updated, ${removed} removed`;
 				console.log(summary);
-				notice.setMessage(summary);
-				setTimeout(() => notice.hide(), 4000);
+				if (notice) {
+					notice.setMessage(summary);
+					setTimeout(() => notice?.hide(), 4000);
+				}
 			} else {
-				notice.hide();
+				notice?.hide();
 			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			console.error("vault-mcp: delta scan failed:", err);
-			notice.setMessage(`Vault MCP: delta scan failed: ${msg}`);
-			setTimeout(() => notice.hide(), 6000);
+			if (notice) {
+				notice.setMessage(`Vault MCP: delta scan failed: ${msg}`);
+				setTimeout(() => notice?.hide(), 6000);
+			} else {
+				new Notice(`Vault MCP: delta scan failed: ${msg}`, 6000);
+			}
 		} finally {
 			this.semanticProgress = null;
 		}
